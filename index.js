@@ -897,8 +897,8 @@ async function authenticateApiKey(req, res, next) {
 // Get wallet balance (API Key)
 app.get('/api/v1/wallet/balance', authenticateApiKey, async (req, res) => {
   try {
-    const { data: user, error } = await supabase
-      .from('users')
+    const { data: userProfile, error } = await supabase
+      .from('user_profiles')
       .select('wallet_balance')
       .eq('id', req.userId)
       .single();
@@ -909,7 +909,7 @@ app.get('/api/v1/wallet/balance', authenticateApiKey, async (req, res) => {
 
     res.json({
       success: true,
-      balance: user.wallet_balance || DEFAULT_WALLET_BALANCE,
+      balance: userProfile?.wallet_balance || DEFAULT_WALLET_BALANCE,
       currency: 'IQD'
     });
   } catch (error) {
