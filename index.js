@@ -614,6 +614,19 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
     console.log(`📱 Sending OTP to ${chatId}`);
     
     try {
+      // Try to get the number ID first (resolves LID issue)
+      let numberId;
+      try {
+        numberId = await client.getNumberId(formattedNumber);
+        if (numberId) {
+          chatId = numberId._serialized;
+          console.log(`✅ Resolved number ID for ${formattedNumber}: ${chatId}`);
+        }
+      } catch (lidError) {
+        console.log(`⚠️ Could not resolve number ID for ${formattedNumber}, trying direct send...`);
+        // Continue with original chatId if resolution fails
+      }
+      
       await client.sendMessage(chatId, message);
       console.log('✅ OTP sent successfully');
 
@@ -774,7 +787,20 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
           break; // Stop sending to remaining recipients
         }
 
-        const chatId = `${recipient}@c.us`;
+        // Format phone number
+        const formattedRecipient = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
+        let chatId = `${formattedRecipient}@c.us`;
+        
+        // Try to resolve number ID first
+        try {
+          const numberId = await client.getNumberId(formattedRecipient);
+          if (numberId) {
+            chatId = numberId._serialized;
+          }
+        } catch (lidError) {
+          // Continue with original chatId
+        }
+        
         await client.sendMessage(chatId, message);
         sent++;
         console.log(`✅ Sent to ${recipient}`);
@@ -986,9 +1012,23 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
       });
     }
 
-    const chatId = recipient.includes('@') ? recipient : `${recipient}@c.us`;
+    // Format phone number (remove any non-digits except +, then remove +)
+    const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
+    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
     
     try {
+      // Try to get the number ID first (resolves LID issue)
+      let numberId;
+      try {
+        numberId = await client.getNumberId(chatId.replace('@c.us', ''));
+        if (numberId) {
+          chatId = numberId._serialized;
+        }
+      } catch (lidError) {
+        console.log(`⚠️ Could not resolve number ID for ${chatId}, trying direct send...`);
+        // Continue with original chatId if resolution fails
+      }
+      
       await client.sendMessage(chatId, message);
 
       // Log to database
