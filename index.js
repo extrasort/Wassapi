@@ -1641,17 +1641,21 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
       const uniqueContacts = new Set(logs?.map(l => l.recipient) || []).size;
       const avgPerDay = accountAgeDays > 0 ? totalSent / accountAgeDays : 0;
       
-      // Calculate basic score
+      // Calculate basic score with improved formula
+      const engagementRate = accountAgeDays > 7 && totalSent > 5 ? 25 : 
+                           accountAgeDays > 3 && totalSent > 2 ? 15 : 5;
+      
       const strengthScore = Math.min(100, Math.max(0,
-        Math.min(30, accountAgeDays * 0.5) +
-        Math.min(25, (totalSent / 100.0) * 25) +
-        Math.min(20, (uniqueContacts / 50.0) * 20) +
-        10 // Profile assumed complete
+        Math.min(20, accountAgeDays * 1.33) +  // Account age (15 days = max)
+        Math.min(30, (totalSent / 20.0) * 30) +  // Message volume (20 msgs = max)
+        Math.min(25, (uniqueContacts / 10.0) * 25) +  // Unique contacts (10 = max)
+        Math.min(15, avgPerDay * 15) +  // Consistency (1 msg/day = max)
+        (engagementRate / 100.0) * 10  // Engagement
       ));
 
-      const banRisk = strengthScore >= 80 ? 'low' : 
-                     strengthScore >= 60 ? 'medium' : 
-                     strengthScore >= 40 ? 'high' : 'critical';
+      const banRiskLevel = strengthScore >= 80 ? 'low' : 
+                          strengthScore >= 60 ? 'medium' : 
+                          strengthScore >= 40 ? 'high' : 'critical';
 
       return res.json({
         success: true,
@@ -1662,10 +1666,10 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
           unique_contacts_count: uniqueContacts,
           avg_messages_per_day: parseFloat(avgPerDay.toFixed(2)),
           max_messages_per_hour: 10,
-          engagement_rate: 0,
+          engagement_rate: engagementRate,
           profile_complete: true,
           strength_score: Math.round(strengthScore),
-          ban_risk_level: banRisk,
+          ban_risk_level: banRiskLevel,
           calculated_at: new Date().toISOString()
         }
       });
@@ -1780,42 +1784,130 @@ app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res)
 
     // Perform strengthening activity
     try {
+      let activityDetails = {};
+      
       switch (serviceType) {
         case 'profile_update':
-          // Get profile picture (simulates profile activity)
-          await client.getProfilePicUrl(client.info.wid._serialized);
-          break;
-        case 'message_simulation':
-          // Get chats to simulate reading
-          const chats = await client.getChats();
-          if (chats.length > 0) {
-            const randomChat = chats[Math.floor(Math.random() * chats.length)];
-            await randomChat.fetchMessages({ limit: 1 });
+          // Get profile picture and info (simulates profile activity)
+          try {
+            const profilePic = await client.getProfilePicUrl(client.info.wid._serialized);
+            const info = client.info;
+            activityDetails = {
+              profilePicFetched: !!profilePic,
+              profileName: info.pushname || '',
+              timestamp: new Date().toISOString()
+            };
+            // Also update "last seen" by checking state
+            await client.getState();
+          } catch (err) {
+            console.log('Profile update activity:', err.message);
           }
           break;
+          
+        case 'message_simulation':
+          // Get chats and actually read multiple messages to simulate real activity
+          const chats = await client.getChats();
+          activityDetails.chatsFound = chats.length;
+          
+          if (chats.length > 0) {
+            // Read messages from up to 3 random chats
+            const chatsToRead = chats
+              .sort(() => 0.5 - Math.random())
+              .slice(0, Math.min(3, chats.length));
+            
+            for (const chat of chatsToRead) {
+              try {
+                // Fetch recent messages (simulates reading)
+                const messages = await chat.fetchMessages({ limit: 5 });
+                
+                // Mark as read if possible
+                try {
+                  if (messages.length > 0 && chat.unreadCount > 0) {
+                    await chat.markSeen();
+                  }
+                } catch (readErr) {
+                  // Ignore read errors
+                }
+              } catch (msgErr) {
+                console.log('Error reading chat:', msgErr.message);
+              }
+            }
+            
+            activityDetails.chatsRead = chatsToRead.length;
+            activityDetails.messagesRead = chatsToRead.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+          }
+          break;
+          
         case 'contact_sync':
-          // Get contacts
-          await client.getContacts();
+          // Get and cache contacts (simulates contact sync activity)
+          const contacts = await client.getContacts();
+          activityDetails.contactsCount = contacts.length;
+          
+          // Also get block list to show account is active
+          try {
+            const blockedContacts = await client.getBlockedContacts();
+            activityDetails.blockedCount = blockedContacts.length;
+          } catch (err) {
+            // Blocked contacts might not be available
+          }
           break;
+          
         case 'status_update':
-          // Check connection state
-          await client.getState();
+          // Check connection state and get account info (shows active presence)
+          const state = await client.getState();
+          const accountInfo = client.info;
+          
+          activityDetails.state = state;
+          activityDetails.accountActive = state === 'CONNECTED';
+          activityDetails.pushName = accountInfo.pushname || '';
+          
+          // Also fetch chats count to show activity
+          const allChats = await client.getChats();
+          activityDetails.totalChats = allChats.length;
           break;
+          
         case 'idle_period':
-          // Just wait a bit (no action needed)
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          // Simulate idle by doing minimal activity after delay
+          await new Promise(resolve => setTimeout(resolve, 2000));
+          // Check state to show we're still connected
+          const idleState = await client.getState();
+          activityDetails.idlePeriodSeconds = 2;
+          activityDetails.stateDuringIdle = idleState;
           break;
       }
+      
+      // Log the activity to automation_logs for tracking
+      await supabase.from('automation_logs').insert({
+        user_id: userId,
+        session_id: sessionId,
+        type: 'strengthening',
+        recipient: serviceType,
+        message: `Strengthening service: ${serviceType}`,
+        status: 'sent'
+      });
 
-      // Update log as completed
+      // Update log as completed with activity details
       await supabase
         .from('strengthening_logs')
         .update({
           service_status: 'completed',
           completed_at: new Date().toISOString(),
-          service_details: { success: true, timestamp: new Date().toISOString() }
+          service_details: { 
+            success: true, 
+            timestamp: new Date().toISOString(),
+            ...activityDetails
+          }
         })
         .eq('id', logEntry.id);
+      
+      // Trigger account strength metrics recalculation
+      try {
+        await supabase.rpc('update_account_strength_metrics', {
+          p_session_id: sessionId
+        });
+      } catch (recalcError) {
+        console.log('Could not recalculate metrics:', recalcError.message);
+      }
 
       // Update last activity
       await supabase

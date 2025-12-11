@@ -95,23 +95,39 @@ BEGIN
     ELSE 0 
   END;
   
-  -- Default values for now (would need more tracking)
-  v_max_per_hour := 10;
-  v_engagement_rate := 0;
+  -- Get max messages per hour from recent activity (last 24 hours)
+  SELECT COALESCE(MAX(hourly_count), 10) INTO v_max_per_hour
+  FROM (
+    SELECT DATE_TRUNC('hour', created_at) as hour, COUNT(*) as hourly_count
+    FROM automation_logs
+    WHERE session_id = p_session_id 
+      AND status = 'sent'
+      AND created_at >= NOW() - INTERVAL '24 hours'
+    GROUP BY DATE_TRUNC('hour', created_at)
+  ) AS hourly_stats;
+  
+  -- Calculate engagement rate from messages with replies (simplified - would need message tracking)
+  -- For now, use a baseline based on account age and message volume
+  v_engagement_rate := CASE
+    WHEN v_account_age_days > 7 AND v_total_sent > 5 THEN 25.0
+    WHEN v_account_age_days > 3 AND v_total_sent > 2 THEN 15.0
+    ELSE 5.0
+  END;
+  
   v_profile_complete := true; -- Assume complete for now
   
-  -- Calculate strength score (0-100)
+  -- Calculate strength score (0-100) with improved formula
   v_strength_score := LEAST(100, GREATEST(0,
-    -- Account age contributes up to 30 points
-    LEAST(30, v_account_age_days * 0.5) +
-    -- Message volume contributes up to 25 points (normalized)
-    LEAST(25, (v_total_sent / 100.0) * 25) +
-    -- Unique contacts contribute up to 20 points
-    LEAST(20, (v_unique_contacts / 50.0) * 20) +
-    -- Engagement contributes up to 15 points
-    (v_engagement_rate / 100.0) * 15 +
-    -- Profile completeness contributes 10 points
-    CASE WHEN v_profile_complete THEN 10 ELSE 0 END
+    -- Account age contributes up to 20 points (15 days = max)
+    LEAST(20, v_account_age_days * 1.33) +
+    -- Message volume contributes up to 30 points (20 messages = max)
+    LEAST(30, (v_total_sent / 20.0) * 30) +
+    -- Unique contacts contribute up to 25 points (10 contacts = max)
+    LEAST(25, (v_unique_contacts / 10.0) * 25) +
+    -- Message consistency contributes up to 15 points (avg 1+ msg/day = max)
+    LEAST(15, v_avg_per_day * 15) +
+    -- Engagement contributes up to 10 points (if we have engagement data)
+    (v_engagement_rate / 100.0) * 10
   ));
   
   -- Determine ban risk level
