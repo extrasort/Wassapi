@@ -852,9 +852,21 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
 // API Key Authentication Middleware
 async function authenticateApiKey(req, res, next) {
   try {
-    const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
+    // Get API key from headers (case-insensitive)
+    const apiKey = req.headers['x-api-key'] || 
+                   req.headers['X-API-Key'] ||
+                   req.headers['X-API-KEY'] ||
+                   req.headers['authorization']?.replace('Bearer ', '') ||
+                   req.headers['Authorization']?.replace('Bearer ', '');
+    
+    console.log('🔑 API Key auth check:', {
+      hasHeader: !!req.headers['x-api-key'] || !!req.headers['X-API-Key'],
+      headerKeys: Object.keys(req.headers).filter(k => k.toLowerCase().includes('api') || k.toLowerCase().includes('authorization')),
+      apiKeyPrefix: apiKey ? apiKey.substring(0, 10) + '...' : 'none'
+    });
     
     if (!apiKey) {
+      console.error('❌ No API key found in headers');
       return res.status(401).json({ error: 'API key is required' });
     }
 
