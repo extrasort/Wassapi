@@ -238,17 +238,133 @@ app.get('/api/test', (req, res) => {
   });
 });
 
+// Restore active sessions on server startup
+async function restoreActiveSessions() {
+  try {
+    console.log('🔄 Restoring active WhatsApp sessions...');
+    const { data: activeSessions, error } = await supabase
+      .from('whatsapp_sessions')
+      .select('*')
+      .eq('status', 'connected');
+
+    if (error) {
+      console.error('❌ Error fetching active sessions:', error);
+      return;
+    }
+
+    if (!activeSessions || activeSessions.length === 0) {
+      console.log('✅ No active sessions to restore');
+      return;
+    }
+
+    console.log(`📱 Found ${activeSessions.length} active session(s) to restore`);
+
+    // Restore each active session
+    for (const session of activeSessions) {
+      try {
+        await restoreClient(session.user_id, session.session_id);
+      } catch (error) {
+        console.error(`❌ Failed to restore session ${session.session_id}:`, error.message);
+        // Mark as disconnected if restore fails
+        await supabase
+          .from('whatsapp_sessions')
+          .update({ status: 'disconnected' })
+          .eq('session_id', session.session_id);
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error restoring active sessions:', error);
+  }
+}
+
+// Restore a single WhatsApp client (without creating new session)
+async function restoreClient(userId, sessionId) {
+  try {
+    console.log(`🔄 Restoring client for session ${sessionId}`);
+    
+    // Puppeteer configuration
+    const puppeteerOptions = {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-software-rasterizer',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--max-old-space-size=512',
+      ],
+    };
+
+    // Use system Chromium if available
+    if (process.env.PUPPETEER_EXECUTABLE_PATH || fs.existsSync('/usr/bin/chromium')) {
+      const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || '/usr/bin/chromium';
+      puppeteerOptions.executablePath = execPath;
+      console.log(`✅ Using Chromium from: ${execPath}`);
+    }
+
+    const client = new Client({
+      authStrategy: new LocalAuth({ clientId: sessionId }),
+      puppeteer: puppeteerOptions,
+    });
+
+    // Set up event handlers
+    client.on('ready', async () => {
+      console.log(`✅ WhatsApp client restored and ready for session ${sessionId}`);
+      const info = client.info;
+      console.log(`📱 Connected to: ${info.wid.user}`);
+      
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ last_activity: new Date().toISOString() })
+        .eq('session_id', sessionId);
+    });
+
+    client.on('auth_failure', async (msg) => {
+      console.error(`❌ Auth failure for restored session ${sessionId}:`, msg);
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ status: 'failed' })
+        .eq('session_id', sessionId);
+      clients.delete(sessionId);
+    });
+
+    client.on('disconnected', async (reason) => {
+      console.log(`⚠️ Disconnected for restored session ${sessionId}:`, reason);
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ status: 'disconnected' })
+        .eq('session_id', sessionId);
+      clients.delete(sessionId);
+    });
+
+    await client.initialize();
+    clients.set(sessionId, client);
+    console.log(`✅ Client restored and stored for session ${sessionId}`);
+  } catch (error) {
+    console.error(`❌ Error restoring client for session ${sessionId}:`, error);
+    throw error;
+  }
+}
+
 // Initialize WhatsApp client for a user
 async function initializeClient(userId, sessionId) {
   try {
     console.log(`Initializing WhatsApp client for user ${userId}, session ${sessionId}`);
     
-    // Check if user already has a connected session
+    // Check if user already has a connected session (skip if restoring)
     const { data: existingSessions } = await supabase
       .from('whatsapp_sessions')
       .select('*')
       .eq('user_id', userId)
       .eq('status', 'connected')
+      .neq('session_id', sessionId)
       .limit(1);
 
     if (existingSessions && existingSessions.length > 0) {
@@ -1348,11 +1464,23 @@ app.post('/api/api-keys/revoke/:userId/:sessionId', async (req, res) => {
 // Railway provides PORT, default to 5000 for local development
 const PORT = process.env.PORT || 5000;
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('');
-  console.log('🚀 Wassapi backend server running on port', PORT);
-  console.log('📍 Health check: http://localhost:' + PORT + '/health');
-  console.log('📍 Test endpoint: http://localhost:' + PORT + '/api/test');
-  console.log('🌐 Trust proxy enabled for Railway');
-  console.log('');
+// Start server and restore active sessions
+async function startServer() {
+  // Restore active sessions before starting server
+  await restoreActiveSessions();
+  
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log('');
+    console.log('🚀 Wassapi backend server running on port', PORT);
+    console.log('📍 Health check: http://localhost:' + PORT + '/health');
+    console.log('📍 Test endpoint: http://localhost:' + PORT + '/api/test');
+    console.log('🌐 Trust proxy enabled for Railway');
+    console.log(`📊 Active clients: ${clients.size}`);
+    console.log('');
+  });
+}
+
+startServer().catch((error) => {
+  console.error('❌ Failed to start server:', error);
+  process.exit(1);
 });
