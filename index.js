@@ -776,7 +776,10 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
     }
 
     const message = `Your OTP code is: ${otp}`;
-    const chatId = `${recipient}@c.us`;
+    
+    // Format phone number (remove any non-digits except +, then remove +)
+    const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
+    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
     
     console.log(`📱 Sending OTP to ${chatId}`);
     
@@ -784,13 +787,13 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       // Try to get the number ID first (resolves LID issue)
       let numberId;
       try {
-        numberId = await client.getNumberId(formattedNumber);
+        numberId = await client.getNumberId(chatId.replace('@c.us', ''));
         if (numberId) {
           chatId = numberId._serialized;
           console.log(`✅ Resolved number ID for ${formattedNumber}: ${chatId}`);
         }
       } catch (lidError) {
-        console.log(`⚠️ Could not resolve number ID for ${formattedNumber}, trying direct send...`);
+        console.log(`⚠️ Could not resolve number ID for ${chatId}, trying direct send...`);
         // Continue with original chatId if resolution fails
       }
       
