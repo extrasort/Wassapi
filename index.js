@@ -289,6 +289,9 @@ async function restoreClient(userId, sessionId) {
   return new Promise((resolve, reject) => {
     console.log(`🔄 Restoring client for session ${sessionId}`);
     
+    let isResolved = false;
+    let timeoutId;
+    
     // Puppeteer configuration
     const puppeteerOptions = {
       headless: true,
@@ -323,16 +326,27 @@ async function restoreClient(userId, sessionId) {
 
     // Set up event handlers
     client.on('ready', async () => {
+      if (isResolved) return; // Already handled
+      
+      clearTimeout(timeoutId);
+      isResolved = true;
+      
       console.log(`✅ WhatsApp client restored and ready for session ${sessionId}`);
       const info = client.info;
       console.log(`📱 Connected to: ${info.wid.user}`);
       
+      // Store client in map if not already stored
+      clients.set(sessionId, client);
+      
       await supabase
         .from('whatsapp_sessions')
-        .update({ last_activity: new Date().toISOString() })
+        .update({ 
+          status: 'connected',
+          last_activity: new Date().toISOString() 
+        })
         .eq('session_id', sessionId);
       
-      resolve(client); // Resolve when client is ready
+      resolve(client);
     });
 
     client.on('authenticated', () => {
@@ -340,6 +354,10 @@ async function restoreClient(userId, sessionId) {
     });
 
     client.on('auth_failure', async (msg) => {
+      clearTimeout(timeoutId);
+      if (isResolved) return;
+      isResolved = true;
+      
       console.error(`❌ Auth failure for restored session ${sessionId}:`, msg);
       await supabase
         .from('whatsapp_sessions')
@@ -358,25 +376,31 @@ async function restoreClient(userId, sessionId) {
       clients.delete(sessionId);
     });
 
-    // Initialize and store client immediately (ready event will fire later)
+    // Initialize client
     client.initialize().then(() => {
+      // Store client immediately - ready event will fire later
       clients.set(sessionId, client);
       console.log(`✅ Client restored and stored for session ${sessionId} (waiting for ready...)`);
-      // Don't resolve here - wait for 'ready' event
+      
+      // Set timeout to 60 seconds (increased from 30)
+      timeoutId = setTimeout(() => {
+        if (!isResolved && !client.info) {
+          console.warn(`⚠️ Client for session ${sessionId} did not become ready within 60 seconds - will continue waiting asynchronously`);
+          // Don't resolve - let client become ready in background
+          // The client is already stored in the map, so it will work when ready
+          isResolved = true;
+          resolve(client); // Resolve to avoid hanging promise, but client isn't ready yet
+        }
+      }, 60000); // Increased to 60 seconds
     }).catch((error) => {
+      clearTimeout(timeoutId);
+      if (isResolved) return;
+      isResolved = true;
+      
       console.error(`❌ Error initializing restored client for session ${sessionId}:`, error);
       clients.delete(sessionId);
       reject(error);
     });
-
-    // Timeout after 30 seconds if client doesn't become ready
-    setTimeout(() => {
-      if (!client.info) {
-        console.warn(`⚠️ Client for session ${sessionId} did not become ready within timeout`);
-        // Still resolve - client might become ready later
-        resolve(client);
-      }
-    }, 30000);
   });
 }
 
@@ -1142,6 +1166,13 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
     }
 
     if (!isClientReady(client)) {
+      // Check if client exists but isn't ready yet
+      if (client && !client.info) {
+        return res.status(503).json({ 
+          error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
+          sessionStatus: 'initializing'
+        });
+      }
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
     }
 
@@ -1245,6 +1276,13 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
     }
 
     if (!isClientReady(client)) {
+      // Check if client exists but isn't ready yet
+      if (client && !client.info) {
+        return res.status(503).json({ 
+          error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
+          sessionStatus: 'initializing'
+        });
+      }
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
     }
 
@@ -1354,6 +1392,25 @@ app.get('/api/v1/auth/info', authenticateApiKey, async (req, res) => {
       createdAt: req.apiKey.created_at
     }
   });
+});
+
+// Get session status (API Key)
+app.get('/api/v1/session/status', authenticateApiKey, async (req, res) => {
+  try {
+    const client = clients.get(req.sessionId);
+    const isReady = isClientReady(client);
+    
+    res.json({
+      success: true,
+      sessionId: req.sessionId,
+      isReady,
+      hasClient: !!client,
+      hasInfo: client ? !!client.info : false
+    });
+  } catch (error) {
+    console.error('❌ Error checking session status:', error);
+    res.status(500).json({ error: error.message });
+  }
 });
 
 // ==================== USER ENDPOINTS (Dashboard) ====================
