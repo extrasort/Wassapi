@@ -126,6 +126,8 @@ async function initializeClient(userId, sessionId) {
     }
 
     // Puppeteer configuration for Linux deployment
+    // Note: Removed --single-process as it causes session instability
+    // Use Railway's resource limits instead for memory management
     const puppeteerOptions = {
       headless: true,
       args: [
@@ -134,7 +136,6 @@ async function initializeClient(userId, sessionId) {
         '--disable-dev-shm-usage',
         '--disable-accelerated-2d-canvas',
         '--no-first-run',
-        '--no-zygote',
         '--disable-gpu',
         '--disable-extensions',
         '--disable-default-apps',
@@ -142,7 +143,7 @@ async function initializeClient(userId, sessionId) {
         '--disable-background-timer-throttling',
         '--disable-backgrounding-occluded-windows',
         '--disable-renderer-backgrounding',
-        '--single-process', // Important for Railway/limited memory environments
+        '--max-old-space-size=512', // Limit memory per process
       ],
     };
 
@@ -251,6 +252,11 @@ async function initializeClient(userId, sessionId) {
         .update({ status: 'disconnected' })
         .eq('session_id', sessionId);
       clients.delete(sessionId);
+    });
+
+    // Handle page crashes
+    client.on('remote_session_saved', () => {
+      console.log(`✅ Remote session saved for ${sessionId}`);
     });
 
     console.log('🚀 Initializing WhatsApp client...');
@@ -363,6 +369,40 @@ app.post('/api/whatsapp/disconnect/:sessionId', async (req, res) => {
   }
 });
 
+// Helper function to check if client is ready and connected
+function isClientReady(client) {
+  try {
+    // Check if client exists and is initialized
+    if (!client) {
+      return false;
+    }
+    
+    // Check if client has info (means it's authenticated and ready)
+    if (!client.info) {
+      return false;
+    }
+    
+    // Try to access the puppeteer page through the client
+    // whatsapp-web.js stores the page internally
+    try {
+      // The client has a _pupPage property or similar
+      // If we can't access it, we'll rely on the info check
+      const page = client.pupPage || (client.pupBrowser && client.pupBrowser.pages && client.pupBrowser.pages()[0]);
+      if (page && typeof page.isClosed === 'function' && page.isClosed()) {
+        return false;
+      }
+    } catch (pageError) {
+      // If we can't check the page, assume it's okay if client.info exists
+      // This is a fallback for cases where page structure is different
+    }
+    
+    return true;
+  } catch (error) {
+    console.error('❌ Error checking client readiness:', error);
+    return false;
+  }
+}
+
 // Send OTP
 app.post('/api/whatsapp/send-otp', async (req, res) => {
   try {
@@ -372,15 +412,29 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
     const client = clients.get(sessionId);
     if (!client) {
       console.error(`❌ Session ${sessionId} not found in active clients`);
-      return res.status(404).json({ error: 'Session not found' });
+      return res.status(404).json({ error: 'Session not found. Please reconnect your WhatsApp account.' });
+    }
+
+    // Check if client is still ready
+    if (!isClientReady(client)) {
+      console.error(`❌ Client for session ${sessionId} is not ready or disconnected`);
+      // Clean up the invalid client
+      clients.delete(sessionId);
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ status: 'disconnected' })
+        .eq('session_id', sessionId);
+      return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
     }
 
     const message = `Your OTP code is: ${otp}`;
     const chatId = `${recipient}@c.us`;
     
     console.log(`📱 Sending OTP to ${chatId}`);
-    await client.sendMessage(chatId, message);
-    console.log('✅ OTP sent successfully');
+    
+    try {
+      await client.sendMessage(chatId, message);
+      console.log('✅ OTP sent successfully');
 
     // Log to database
     await supabase.from('automation_logs').insert({
@@ -392,10 +446,28 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       status: 'sent',
     });
 
-    res.json({ success: true });
+      res.json({ success: true });
+    } catch (sendError) {
+      console.error('❌ Error sending OTP message:', sendError);
+      
+      // If session is closed, clean up the client
+      if (sendError.message && sendError.message.includes('Session closed')) {
+        console.log(`🧹 Cleaning up disconnected client for session ${sessionId}`);
+        clients.delete(sessionId);
+        await supabase
+          .from('whatsapp_sessions')
+          .update({ status: 'disconnected' })
+          .eq('session_id', sessionId);
+        return res.status(400).json({ 
+          error: 'WhatsApp session was closed. Please reconnect your account and try again.' 
+        });
+      }
+      
+      throw sendError;
+    }
   } catch (error) {
     console.error('❌ Error sending OTP:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Failed to send OTP. Please try again.' });
   }
 });
 
@@ -408,7 +480,19 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     const client = clients.get(sessionId);
     if (!client) {
       console.error(`❌ Session ${sessionId} not found`);
-      return res.status(404).json({ error: 'Session not found' });
+      return res.status(404).json({ error: 'Session not found. Please reconnect your WhatsApp account.' });
+    }
+
+    // Check if client is still ready
+    if (!isClientReady(client)) {
+      console.error(`❌ Client for session ${sessionId} is not ready or disconnected`);
+      // Clean up the invalid client
+      clients.delete(sessionId);
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ status: 'disconnected' })
+        .eq('session_id', sessionId);
+      return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
     }
 
     let sent = 0;
@@ -417,12 +501,44 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     console.log(`📱 Sending to ${recipients.length} recipients`);
     for (const recipient of recipients) {
       try {
+        // Check client before each message
+        if (!isClientReady(client)) {
+          console.error(`❌ Client disconnected during sending to ${recipient}`);
+          errors.push({ 
+            recipient, 
+            error: 'WhatsApp session was disconnected. Please reconnect and try again.' 
+          });
+          // Clean up the invalid client
+          clients.delete(sessionId);
+          await supabase
+            .from('whatsapp_sessions')
+            .update({ status: 'disconnected' })
+            .eq('session_id', sessionId);
+          break; // Stop sending to remaining recipients
+        }
+
         const chatId = `${recipient}@c.us`;
         await client.sendMessage(chatId, message);
         sent++;
         console.log(`✅ Sent to ${recipient}`);
       } catch (error) {
         console.error(`❌ Failed to send to ${recipient}:`, error.message);
+        
+        // If session is closed, stop sending and clean up
+        if (error.message && error.message.includes('Session closed')) {
+          console.log(`🧹 Client disconnected, stopping announcement send`);
+          clients.delete(sessionId);
+          await supabase
+            .from('whatsapp_sessions')
+            .update({ status: 'disconnected' })
+            .eq('session_id', sessionId);
+          errors.push({ 
+            recipient, 
+            error: 'WhatsApp session was closed. Please reconnect your account and try again.' 
+          });
+          break; // Stop sending to remaining recipients
+        }
+        
         errors.push({ recipient, error: error.message });
       }
     }
