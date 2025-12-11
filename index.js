@@ -113,9 +113,9 @@ function generateApiSecret() {
 // Helper function to initialize wallet balance for user
 async function initializeWalletBalance(userId) {
   try {
-    // Check if user exists and has wallet balance
-    const { data: user, error: fetchError } = await supabase
-      .from('users')
+    // Check if user profile exists and has wallet balance (using user_profiles for Supabase Auth)
+    const { data: userProfile, error: fetchError } = await supabase
+      .from('user_profiles')
       .select('wallet_balance')
       .eq('id', userId)
       .single();
@@ -125,12 +125,15 @@ async function initializeWalletBalance(userId) {
       return;
     }
 
-    // If user doesn't exist or balance is null, initialize it
-    if (!user || user.wallet_balance === null) {
+    // If user profile doesn't exist or balance is null, initialize it
+    if (!userProfile || userProfile.wallet_balance === null) {
+      // Insert or update user profile with wallet balance
       const { error: updateError } = await supabase
-        .from('users')
-        .update({ wallet_balance: DEFAULT_WALLET_BALANCE })
-        .eq('id', userId);
+        .from('user_profiles')
+        .upsert({ 
+          id: userId,
+          wallet_balance: DEFAULT_WALLET_BALANCE 
+        }, { onConflict: 'id' });
 
       if (updateError) {
         console.error('❌ Error initializing wallet balance:', updateError);
@@ -155,9 +158,9 @@ async function initializeWalletBalance(userId) {
 // Helper function to deduct wallet balance
 async function deductBalance(userId, sessionId, description, referenceId = null) {
   try {
-    // Get current balance
-    const { data: user, error: fetchError } = await supabase
-      .from('users')
+    // Get current balance from user_profiles (Supabase Auth)
+    const { data: userProfile, error: fetchError } = await supabase
+      .from('user_profiles')
       .select('wallet_balance')
       .eq('id', userId)
       .single();
@@ -166,7 +169,7 @@ async function deductBalance(userId, sessionId, description, referenceId = null)
       throw new Error(`Failed to fetch balance: ${fetchError.message}`);
     }
 
-    const currentBalance = user.wallet_balance || DEFAULT_WALLET_BALANCE;
+    const currentBalance = userProfile?.wallet_balance || DEFAULT_WALLET_BALANCE;
 
     // Check if sufficient balance
     if (currentBalance < MESSAGE_COST_IQD) {
@@ -181,7 +184,7 @@ async function deductBalance(userId, sessionId, description, referenceId = null)
     // Deduct balance
     const newBalance = currentBalance - MESSAGE_COST_IQD;
     const { error: updateError } = await supabase
-      .from('users')
+      .from('user_profiles')
       .update({ wallet_balance: newBalance })
       .eq('id', userId);
 
@@ -633,16 +636,16 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       console.error('❌ Error sending OTP message:', sendError);
       
       // Refund the balance if message failed
-      const { data: user } = await supabase
-        .from('users')
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
         .select('wallet_balance')
         .eq('id', userId)
         .single();
       
-      if (user && balanceCheck.success) {
+      if (userProfile && balanceCheck.success) {
         const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
         await supabase
-          .from('users')
+          .from('user_profiles')
           .update({ wallet_balance: refundedBalance })
           .eq('id', userId);
         
@@ -707,14 +710,14 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     // Calculate total cost
     const totalCost = recipients.length * MESSAGE_COST_IQD;
     
-    // Get current balance
-    const { data: user } = await supabase
-      .from('users')
+    // Get current balance from user_profiles (Supabase Auth)
+    const { data: userProfile } = await supabase
+      .from('user_profiles')
       .select('wallet_balance')
       .eq('id', userId)
       .single();
 
-    const currentBalance = user?.wallet_balance || 0;
+    const currentBalance = userProfile?.wallet_balance || 0;
 
     // Check if sufficient balance
     if (currentBalance < totalCost) {
@@ -731,7 +734,7 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     // Deduct total cost upfront
     const newBalance = currentBalance - totalCost;
     await supabase
-      .from('users')
+      .from('user_profiles')
       .update({ wallet_balance: newBalance })
       .eq('id', userId);
 
@@ -802,7 +805,7 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     if (refundAmount > 0) {
       const finalBalance = newBalance + refundAmount;
       await supabase
-        .from('users')
+        .from('user_profiles')
         .update({ wallet_balance: finalBalance })
         .eq('id', userId);
 
@@ -995,16 +998,16 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
       });
     } catch (sendError) {
       // Refund balance if message failed
-      const { data: user } = await supabase
-        .from('users')
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
         .select('wallet_balance')
         .eq('id', req.userId)
         .single();
       
-      if (user) {
+      if (userProfile && balanceCheck.success) {
         const refundAmount = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
         await supabase
-          .from('users')
+          .from('user_profiles')
           .update({ wallet_balance: refundAmount })
           .eq('id', req.userId);
         
@@ -1052,13 +1055,13 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
 
     // Calculate total cost
     const totalCost = recipients.length * MESSAGE_COST_IQD;
-    const { data: user } = await supabase
-      .from('users')
+    const { data: userProfile } = await supabase
+      .from('user_profiles')
       .select('wallet_balance')
       .eq('id', req.userId)
       .single();
 
-    const currentBalance = user?.wallet_balance || 0;
+    const currentBalance = userProfile?.wallet_balance || 0;
 
     if (currentBalance < totalCost) {
       return res.status(402).json({
@@ -1073,7 +1076,7 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
     // Deduct total cost
     const newBalance = currentBalance - totalCost;
     await supabase
-      .from('users')
+      .from('user_profiles')
       .update({ wallet_balance: newBalance })
       .eq('id', req.userId);
 
@@ -1113,7 +1116,7 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
     if (refundAmount > 0) {
       const finalBalance = newBalance + refundAmount;
       await supabase
-        .from('users')
+        .from('user_profiles')
         .update({ wallet_balance: finalBalance })
         .eq('id', req.userId);
 
@@ -1164,8 +1167,8 @@ app.get('/api/v1/auth/info', authenticateApiKey, async (req, res) => {
 app.get('/api/wallet/balance/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
-    const { data: user, error } = await supabase
-      .from('users')
+    const { data: userProfile, error } = await supabase
+      .from('user_profiles')
       .select('wallet_balance')
       .eq('id', userId)
       .single();
@@ -1176,7 +1179,7 @@ app.get('/api/wallet/balance/:userId', async (req, res) => {
 
     res.json({
       success: true,
-      balance: user.wallet_balance || DEFAULT_WALLET_BALANCE,
+      balance: userProfile?.wallet_balance || DEFAULT_WALLET_BALANCE,
       currency: 'IQD'
     });
   } catch (error) {
