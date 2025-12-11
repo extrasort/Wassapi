@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
+const crypto = require('crypto');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
@@ -88,6 +89,132 @@ supabase.from('whatsapp_sessions').select('count').limit(1)
 
 // Store active WhatsApp clients
 const clients = new Map();
+
+// Constants
+const MESSAGE_COST_IQD = 10.00;
+const DEFAULT_WALLET_BALANCE = 1000.00;
+
+// Helper function to generate API key
+function generateApiKey() {
+  const randomBytes = crypto.randomBytes(32);
+  const apiKey = 'wass_' + randomBytes.toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=/g, '')
+    .substring(0, 48);
+  return apiKey;
+}
+
+// Helper function to generate API secret
+function generateApiSecret() {
+  return crypto.randomBytes(64).toString('hex');
+}
+
+// Helper function to initialize wallet balance for user
+async function initializeWalletBalance(userId) {
+  try {
+    // Check if user exists and has wallet balance
+    const { data: user, error: fetchError } = await supabase
+      .from('users')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    if (fetchError && fetchError.code !== 'PGRST116') { // PGRST116 = not found
+      console.error('❌ Error checking wallet balance:', fetchError);
+      return;
+    }
+
+    // If user doesn't exist or balance is null, initialize it
+    if (!user || user.wallet_balance === null) {
+      const { error: updateError } = await supabase
+        .from('users')
+        .update({ wallet_balance: DEFAULT_WALLET_BALANCE })
+        .eq('id', userId);
+
+      if (updateError) {
+        console.error('❌ Error initializing wallet balance:', updateError);
+      } else {
+        // Log initial transaction
+        await supabase.from('wallet_transactions').insert({
+          user_id: userId,
+          transaction_type: 'initial',
+          amount: DEFAULT_WALLET_BALANCE,
+          balance_before: 0,
+          balance_after: DEFAULT_WALLET_BALANCE,
+          description: 'Initial wallet balance'
+        });
+        console.log(`✅ Wallet balance initialized to ${DEFAULT_WALLET_BALANCE} IQD for user ${userId}`);
+      }
+    }
+  } catch (error) {
+    console.error('❌ Error in initializeWalletBalance:', error);
+  }
+}
+
+// Helper function to deduct wallet balance
+async function deductBalance(userId, sessionId, description, referenceId = null) {
+  try {
+    // Get current balance
+    const { data: user, error: fetchError } = await supabase
+      .from('users')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    if (fetchError) {
+      throw new Error(`Failed to fetch balance: ${fetchError.message}`);
+    }
+
+    const currentBalance = user.wallet_balance || DEFAULT_WALLET_BALANCE;
+
+    // Check if sufficient balance
+    if (currentBalance < MESSAGE_COST_IQD) {
+      return {
+        success: false,
+        error: 'Insufficient balance',
+        currentBalance,
+        required: MESSAGE_COST_IQD
+      };
+    }
+
+    // Deduct balance
+    const newBalance = currentBalance - MESSAGE_COST_IQD;
+    const { error: updateError } = await supabase
+      .from('users')
+      .update({ wallet_balance: newBalance })
+      .eq('id', userId);
+
+    if (updateError) {
+      throw new Error(`Failed to update balance: ${updateError.message}`);
+    }
+
+    // Log transaction
+    await supabase.from('wallet_transactions').insert({
+      user_id: userId,
+      session_id: sessionId,
+      transaction_type: 'debit',
+      amount: MESSAGE_COST_IQD,
+      balance_before: currentBalance,
+      balance_after: newBalance,
+      description,
+      reference_id: referenceId
+    });
+
+    return {
+      success: true,
+      balanceBefore: currentBalance,
+      balanceAfter: newBalance,
+      amountDeducted: MESSAGE_COST_IQD
+    };
+  } catch (error) {
+    console.error('❌ Error deducting balance:', error);
+    return {
+      success: false,
+      error: error.message
+    };
+  }
+}
 
 // Health check endpoint
 app.get('/health', (req, res) => {
@@ -201,14 +328,18 @@ async function initializeClient(userId, sessionId) {
     client.on('ready', async () => {
       console.log(`✅ WhatsApp client ready for session ${sessionId}`);
       const info = client.info;
-      console.log(`📱 Connected to: ${info.wid.user}`);
+      const phoneNumber = info.wid.user;
+      console.log(`📱 Connected to: ${phoneNumber}`);
+      
+      // Initialize wallet balance if needed
+      await initializeWalletBalance(userId);
       
       // Update session in database
       const { error } = await supabase
         .from('whatsapp_sessions')
         .update({
           status: 'connected',
-          phone_number: info.wid.user,
+          phone_number: phoneNumber,
           qr_code: null,
           last_activity: new Date().toISOString(),
         })
@@ -229,6 +360,42 @@ async function initializeClient(userId, sessionId) {
       
       if (disconnectError) {
         console.error('⚠️ Error disconnecting old sessions:', disconnectError);
+      }
+
+      // Generate API key for this phone number
+      try {
+        // Check if API key already exists for this session
+        const { data: existingKey } = await supabase
+          .from('api_keys')
+          .select('*')
+          .eq('session_id', sessionId)
+          .eq('is_active', true)
+          .single();
+
+        if (!existingKey) {
+          const apiKey = generateApiKey();
+          const apiSecret = generateApiSecret();
+
+          const { error: apiKeyError } = await supabase
+            .from('api_keys')
+            .insert({
+              user_id: userId,
+              session_id: sessionId,
+              phone_number: phoneNumber,
+              api_key: apiKey,
+              api_secret: apiSecret,
+              is_active: true
+            });
+
+          if (apiKeyError) {
+            console.error('❌ Error creating API key:', apiKeyError);
+          } else {
+            console.log(`✅ API key generated for phone ${phoneNumber}`);
+            console.log(`🔑 API Key: ${apiKey}`);
+          }
+        }
+      } catch (apiError) {
+        console.error('❌ Error in API key generation:', apiError);
       }
     });
 
@@ -427,6 +594,17 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
     }
 
+    // Check and deduct wallet balance
+    const balanceCheck = await deductBalance(userId, sessionId, `OTP sent to ${recipient}`, `otp_${Date.now()}`);
+    if (!balanceCheck.success) {
+      return res.status(402).json({
+        error: balanceCheck.error || 'Insufficient balance',
+        currentBalance: balanceCheck.currentBalance,
+        required: MESSAGE_COST_IQD,
+        message: `You need ${MESSAGE_COST_IQD} IQD to send this message. Your current balance is ${balanceCheck.currentBalance || 0} IQD.`
+      });
+    }
+
     const message = `Your OTP code is: ${otp}`;
     const chatId = `${recipient}@c.us`;
     
@@ -436,19 +614,50 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       await client.sendMessage(chatId, message);
       console.log('✅ OTP sent successfully');
 
-    // Log to database
-    await supabase.from('automation_logs').insert({
-      user_id: userId,
-      session_id: sessionId,
-      type: 'otp',
-      recipient,
-      message: `OTP: ${otp}`,
-      status: 'sent',
-    });
+      // Log to database
+      await supabase.from('automation_logs').insert({
+        user_id: userId,
+        session_id: sessionId,
+        type: 'otp',
+        recipient,
+        message: `OTP: ${otp}`,
+        status: 'sent',
+      });
 
-      res.json({ success: true });
-    } catch (sendError) {
+      res.json({ 
+        success: true,
+        balance: balanceCheck.balanceAfter,
+        message: 'OTP sent successfully'
+      });
+      } catch (sendError) {
       console.error('❌ Error sending OTP message:', sendError);
+      
+      // Refund the balance if message failed
+      const { data: user } = await supabase
+        .from('users')
+        .select('wallet_balance')
+        .eq('id', userId)
+        .single();
+      
+      if (user && balanceCheck.success) {
+        const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+        await supabase
+          .from('users')
+          .update({ wallet_balance: refundedBalance })
+          .eq('id', userId);
+        
+        await supabase.from('wallet_transactions').insert({
+          user_id: userId,
+          session_id: sessionId,
+          transaction_type: 'credit',
+          amount: MESSAGE_COST_IQD,
+          balance_before: balanceCheck.balanceAfter,
+          balance_after: refundedBalance,
+          description: `Refund: Failed to send OTP to ${recipient}`,
+          reference_id: `refund_otp_${Date.now()}`
+        });
+        console.log('💰 Balance refunded due to send failure');
+      }
       
       // If session is closed, clean up the client
       if (sendError.message && sendError.message.includes('Session closed')) {
@@ -495,8 +704,52 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
     }
 
+    // Calculate total cost
+    const totalCost = recipients.length * MESSAGE_COST_IQD;
+    
+    // Get current balance
+    const { data: user } = await supabase
+      .from('users')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    const currentBalance = user?.wallet_balance || 0;
+
+    // Check if sufficient balance
+    if (currentBalance < totalCost) {
+      return res.status(402).json({
+        error: 'Insufficient balance',
+        currentBalance,
+        required: totalCost,
+        recipients: recipients.length,
+        costPerMessage: MESSAGE_COST_IQD,
+        message: `You need ${totalCost} IQD to send ${recipients.length} messages. Your current balance is ${currentBalance} IQD.`
+      });
+    }
+
+    // Deduct total cost upfront
+    const newBalance = currentBalance - totalCost;
+    await supabase
+      .from('users')
+      .update({ wallet_balance: newBalance })
+      .eq('id', userId);
+
+    // Log transaction
+    await supabase.from('wallet_transactions').insert({
+      user_id: userId,
+      session_id: sessionId,
+      transaction_type: 'debit',
+      amount: totalCost,
+      balance_before: currentBalance,
+      balance_after: newBalance,
+      description: `Announcement to ${recipients.length} recipients`,
+      reference_id: `announcement_${Date.now()}`
+    });
+
     let sent = 0;
     const errors = [];
+    let refundAmount = 0;
 
     console.log(`📱 Sending to ${recipients.length} recipients`);
     for (const recipient of recipients) {
@@ -508,6 +761,7 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
             recipient, 
             error: 'WhatsApp session was disconnected. Please reconnect and try again.' 
           });
+          refundAmount += MESSAGE_COST_IQD;
           // Clean up the invalid client
           clients.delete(sessionId);
           await supabase
@@ -523,6 +777,7 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
         console.log(`✅ Sent to ${recipient}`);
       } catch (error) {
         console.error(`❌ Failed to send to ${recipient}:`, error.message);
+        refundAmount += MESSAGE_COST_IQD;
         
         // If session is closed, stop sending and clean up
         if (error.message && error.message.includes('Session closed')) {
@@ -543,6 +798,27 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
       }
     }
 
+    // Refund failed messages
+    if (refundAmount > 0) {
+      const finalBalance = newBalance + refundAmount;
+      await supabase
+        .from('users')
+        .update({ wallet_balance: finalBalance })
+        .eq('id', userId);
+
+      await supabase.from('wallet_transactions').insert({
+        user_id: userId,
+        session_id: sessionId,
+        transaction_type: 'credit',
+        amount: refundAmount,
+        balance_before: newBalance,
+        balance_after: finalBalance,
+        description: `Refund: Failed to send ${errors.length} messages`,
+        reference_id: `refund_announcement_${Date.now()}`
+      });
+      console.log(`💰 Refunded ${refundAmount} IQD for failed messages`);
+    }
+
     // Log to database
     await supabase.from('automation_logs').insert({
       user_id: userId,
@@ -555,9 +831,461 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     });
 
     console.log(`✅ Announcement sent: ${sent}/${recipients.length} successful`);
-    res.json({ success: true, sent, errors });
+    res.json({ 
+      success: true, 
+      sent, 
+      failed: errors.length,
+      errors,
+      balance: refundAmount > 0 ? newBalance + refundAmount : newBalance,
+      totalCost: sent * MESSAGE_COST_IQD,
+      refunded: refundAmount
+    });
   } catch (error) {
     console.error('❌ Error sending announcement:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// API Key Authentication Middleware
+async function authenticateApiKey(req, res, next) {
+  try {
+    const apiKey = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
+    
+    if (!apiKey) {
+      return res.status(401).json({ error: 'API key is required' });
+    }
+
+    // Find API key in database
+    const { data: apiKeyData, error } = await supabase
+      .from('api_keys')
+      .select('*, whatsapp_sessions(*)')
+      .eq('api_key', apiKey)
+      .eq('is_active', true)
+      .single();
+
+    if (error || !apiKeyData) {
+      return res.status(401).json({ error: 'Invalid API key' });
+    }
+
+    // Update last used timestamp
+    await supabase
+      .from('api_keys')
+      .update({ 
+        last_used_at: new Date().toISOString(),
+        usage_count: (apiKeyData.usage_count || 0) + 1
+      })
+      .eq('id', apiKeyData.id);
+
+    // Attach API key info to request
+    req.apiKey = apiKeyData;
+    req.userId = apiKeyData.user_id;
+    req.sessionId = apiKeyData.session_id;
+    req.phoneNumber = apiKeyData.phone_number;
+
+    next();
+  } catch (error) {
+    console.error('❌ API key authentication error:', error);
+    res.status(500).json({ error: 'Authentication failed' });
+  }
+}
+
+// ==================== EXTERNAL API ENDPOINTS (API Key Auth) ====================
+
+// Get wallet balance (API Key)
+app.get('/api/v1/wallet/balance', authenticateApiKey, async (req, res) => {
+  try {
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('wallet_balance')
+      .eq('id', req.userId)
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      balance: user.wallet_balance || DEFAULT_WALLET_BALANCE,
+      currency: 'IQD'
+    });
+  } catch (error) {
+    console.error('❌ Error fetching balance:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get wallet transactions (API Key)
+app.get('/api/v1/wallet/transactions', authenticateApiKey, async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+
+    const { data: transactions, error } = await supabase
+      .from('wallet_transactions')
+      .select('*')
+      .eq('user_id', req.userId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      transactions,
+      count: transactions.length
+    });
+  } catch (error) {
+    console.error('❌ Error fetching transactions:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Send message via API Key
+app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
+  try {
+    const { recipient, message } = req.body;
+
+    if (!recipient || !message) {
+      return res.status(400).json({ error: 'recipient and message are required' });
+    }
+
+    const client = clients.get(req.sessionId);
+    if (!client) {
+      return res.status(404).json({ error: 'WhatsApp session not found. Please reconnect via the dashboard.' });
+    }
+
+    if (!isClientReady(client)) {
+      return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
+    }
+
+    // Check and deduct balance
+    const balanceCheck = await deductBalance(req.userId, req.sessionId, `Message sent to ${recipient} via API`, `api_${Date.now()}`);
+    if (!balanceCheck.success) {
+      return res.status(402).json({
+        error: balanceCheck.error || 'Insufficient balance',
+        currentBalance: balanceCheck.currentBalance,
+        required: MESSAGE_COST_IQD
+      });
+    }
+
+    const chatId = recipient.includes('@') ? recipient : `${recipient}@c.us`;
+    
+    try {
+      await client.sendMessage(chatId, message);
+
+      // Log to database
+      await supabase.from('automation_logs').insert({
+        user_id: req.userId,
+        session_id: req.sessionId,
+        type: 'api_message',
+        recipient,
+        message,
+        status: 'sent',
+      });
+
+      res.json({
+        success: true,
+        message: 'Message sent successfully',
+        balance: balanceCheck.balanceAfter,
+        recipient,
+        sentAt: new Date().toISOString()
+      });
+    } catch (sendError) {
+      // Refund balance if message failed
+      const { data: user } = await supabase
+        .from('users')
+        .select('wallet_balance')
+        .eq('id', req.userId)
+        .single();
+      
+      if (user) {
+        const refundAmount = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+        await supabase
+          .from('users')
+          .update({ wallet_balance: refundAmount })
+          .eq('id', req.userId);
+        
+        await supabase.from('wallet_transactions').insert({
+          user_id: req.userId,
+          session_id: req.sessionId,
+          transaction_type: 'credit',
+          amount: MESSAGE_COST_IQD,
+          balance_before: balanceCheck.balanceAfter,
+          balance_after: refundAmount,
+          description: `Refund: Failed to send message to ${recipient} via API`,
+          reference_id: `refund_api_${Date.now()}`
+        });
+      }
+
+      throw sendError;
+    }
+  } catch (error) {
+    console.error('❌ Error sending message via API:', error);
+    res.status(500).json({ error: error.message || 'Failed to send message' });
+  }
+});
+
+// Send bulk messages via API Key
+app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
+  try {
+    const { recipients, message } = req.body;
+
+    if (!recipients || !Array.isArray(recipients) || recipients.length === 0) {
+      return res.status(400).json({ error: 'recipients array is required and must not be empty' });
+    }
+
+    if (!message) {
+      return res.status(400).json({ error: 'message is required' });
+    }
+
+    const client = clients.get(req.sessionId);
+    if (!client) {
+      return res.status(404).json({ error: 'WhatsApp session not found. Please reconnect via the dashboard.' });
+    }
+
+    if (!isClientReady(client)) {
+      return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
+    }
+
+    // Calculate total cost
+    const totalCost = recipients.length * MESSAGE_COST_IQD;
+    const { data: user } = await supabase
+      .from('users')
+      .select('wallet_balance')
+      .eq('id', req.userId)
+      .single();
+
+    const currentBalance = user?.wallet_balance || 0;
+
+    if (currentBalance < totalCost) {
+      return res.status(402).json({
+        error: 'Insufficient balance',
+        currentBalance,
+        required: totalCost,
+        recipients: recipients.length,
+        costPerMessage: MESSAGE_COST_IQD
+      });
+    }
+
+    // Deduct total cost
+    const newBalance = currentBalance - totalCost;
+    await supabase
+      .from('users')
+      .update({ wallet_balance: newBalance })
+      .eq('id', req.userId);
+
+    await supabase.from('wallet_transactions').insert({
+      user_id: req.userId,
+      session_id: req.sessionId,
+      transaction_type: 'debit',
+      amount: totalCost,
+      balance_before: currentBalance,
+      balance_after: newBalance,
+      description: `Bulk message to ${recipients.length} recipients via API`,
+      reference_id: `api_bulk_${Date.now()}`
+    });
+
+    let sent = 0;
+    const errors = [];
+    let refundAmount = 0;
+
+    for (const recipient of recipients) {
+      try {
+        if (!isClientReady(client)) {
+          errors.push({ recipient, error: 'Session disconnected' });
+          refundAmount += MESSAGE_COST_IQD;
+          break;
+        }
+
+        const chatId = recipient.includes('@') ? recipient : `${recipient}@c.us`;
+        await client.sendMessage(chatId, message);
+        sent++;
+      } catch (error) {
+        errors.push({ recipient, error: error.message });
+        refundAmount += MESSAGE_COST_IQD;
+      }
+    }
+
+    // Refund failed messages
+    if (refundAmount > 0) {
+      const finalBalance = newBalance + refundAmount;
+      await supabase
+        .from('users')
+        .update({ wallet_balance: finalBalance })
+        .eq('id', req.userId);
+
+      await supabase.from('wallet_transactions').insert({
+        user_id: req.userId,
+        session_id: req.sessionId,
+        transaction_type: 'credit',
+        amount: refundAmount,
+        balance_before: newBalance,
+        balance_after: finalBalance,
+        description: `Refund: Failed to send ${errors.length} messages via API`,
+        reference_id: `refund_api_bulk_${Date.now()}`
+      });
+    }
+
+    res.json({
+      success: true,
+      sent,
+      failed: errors.length,
+      errors,
+      balance: newBalance + refundAmount,
+      totalCost: sent * MESSAGE_COST_IQD,
+      refunded: refundAmount
+    });
+  } catch (error) {
+    console.error('❌ Error sending bulk messages via API:', error);
+    res.status(500).json({ error: error.message || 'Failed to send messages' });
+  }
+});
+
+// Get API key info
+app.get('/api/v1/auth/info', authenticateApiKey, async (req, res) => {
+  res.json({
+    success: true,
+    apiKey: {
+      phoneNumber: req.phoneNumber,
+      sessionId: req.sessionId,
+      lastUsedAt: req.apiKey.last_used_at,
+      usageCount: req.apiKey.usage_count,
+      createdAt: req.apiKey.created_at
+    }
+  });
+});
+
+// ==================== USER ENDPOINTS (Dashboard) ====================
+
+// Get wallet balance
+app.get('/api/wallet/balance/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: user, error } = await supabase
+      .from('users')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      balance: user.wallet_balance || DEFAULT_WALLET_BALANCE,
+      currency: 'IQD'
+    });
+  } catch (error) {
+    console.error('❌ Error fetching balance:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get wallet transactions
+app.get('/api/wallet/transactions/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+    const offset = parseInt(req.query.offset) || 0;
+
+    const { data: transactions, error } = await supabase
+      .from('wallet_transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      transactions,
+      count: transactions.length
+    });
+  } catch (error) {
+    console.error('❌ Error fetching transactions:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get API keys for user
+app.get('/api/api-keys/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: apiKeys, error } = await supabase
+      .from('api_keys')
+      .select('id, phone_number, session_id, is_active, created_at, last_used_at, usage_count')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({
+      success: true,
+      apiKeys: apiKeys.map(key => ({
+        ...key,
+        // Don't expose full API key, only show first 8 chars
+        apiKeyPrefix: key.api_key ? key.api_key.substring(0, 12) + '...' : null
+      }))
+    });
+  } catch (error) {
+    console.error('❌ Error fetching API keys:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get full API key (only for display)
+app.get('/api/api-keys/:userId/:sessionId', async (req, res) => {
+  try {
+    const { userId, sessionId } = req.params;
+    const { data: apiKey, error } = await supabase
+      .from('api_keys')
+      .select('api_key, phone_number, created_at')
+      .eq('user_id', userId)
+      .eq('session_id', sessionId)
+      .single();
+
+    if (error || !apiKey) {
+      return res.status(404).json({ error: 'API key not found' });
+    }
+
+    res.json({
+      success: true,
+      apiKey: apiKey.api_key,
+      phoneNumber: apiKey.phone_number,
+      createdAt: apiKey.created_at
+    });
+  } catch (error) {
+    console.error('❌ Error fetching API key:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Revoke API key
+app.post('/api/api-keys/revoke/:userId/:sessionId', async (req, res) => {
+  try {
+    const { userId, sessionId } = req.params;
+    const { error } = await supabase
+      .from('api_keys')
+      .update({ is_active: false })
+      .eq('user_id', userId)
+      .eq('session_id', sessionId);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, message: 'API key revoked successfully' });
+  } catch (error) {
+    console.error('❌ Error revoking API key:', error);
     res.status(500).json({ error: error.message });
   }
 });
