@@ -1,6 +1,9 @@
 -- Migration: Add Wallet Balance and API Keys
--- Run this SQL in your Supabase SQL Editor
+-- Run this SQL in your Supabase SQL Editor AFTER 000_initial_schema.sql
 -- For Supabase Auth schema (using auth.users and user_profiles)
+--
+-- Prerequisites:
+-- - Must run 000_initial_schema.sql first to create whatsapp_sessions table
 
 -- Add wallet_balance column to user_profiles table (Supabase Auth)
 ALTER TABLE user_profiles ADD COLUMN IF NOT EXISTS wallet_balance DECIMAL(10, 2) DEFAULT 1000.00;
