@@ -259,19 +259,26 @@ async function restoreActiveSessions() {
 
     console.log(`📱 Found ${activeSessions.length} active session(s) to restore`);
 
-    // Restore each active session
-    for (const session of activeSessions) {
+    // Restore each active session (don't await - let them initialize in parallel)
+    const restorePromises = activeSessions.map(async (session) => {
       try {
-        await restoreClient(session.user_id, session.session_id);
+        // Don't await - let it initialize in background
+        restoreClient(session.user_id, session.session_id).catch((error) => {
+          console.error(`❌ Failed to restore session ${session.session_id}:`, error.message);
+          // Mark as disconnected if restore fails
+          supabase
+            .from('whatsapp_sessions')
+            .update({ status: 'disconnected' })
+            .eq('session_id', session.session_id);
+        });
       } catch (error) {
-        console.error(`❌ Failed to restore session ${session.session_id}:`, error.message);
-        // Mark as disconnected if restore fails
-        await supabase
-          .from('whatsapp_sessions')
-          .update({ status: 'disconnected' })
-          .eq('session_id', session.session_id);
+        console.error(`❌ Error starting restore for session ${session.session_id}:`, error.message);
       }
-    }
+    });
+    
+    // Wait a bit for clients to start initializing, but don't block server startup
+    await Promise.allSettled(restorePromises);
+    console.log('✅ Session restoration initiated (clients will become ready asynchronously)');
   } catch (error) {
     console.error('❌ Error restoring active sessions:', error);
   }
@@ -279,7 +286,7 @@ async function restoreActiveSessions() {
 
 // Restore a single WhatsApp client (without creating new session)
 async function restoreClient(userId, sessionId) {
-  try {
+  return new Promise((resolve, reject) => {
     console.log(`🔄 Restoring client for session ${sessionId}`);
     
     // Puppeteer configuration
@@ -324,6 +331,12 @@ async function restoreClient(userId, sessionId) {
         .from('whatsapp_sessions')
         .update({ last_activity: new Date().toISOString() })
         .eq('session_id', sessionId);
+      
+      resolve(client); // Resolve when client is ready
+    });
+
+    client.on('authenticated', () => {
+      console.log(`✅ Authenticated for restored session ${sessionId}`);
     });
 
     client.on('auth_failure', async (msg) => {
@@ -333,6 +346,7 @@ async function restoreClient(userId, sessionId) {
         .update({ status: 'failed' })
         .eq('session_id', sessionId);
       clients.delete(sessionId);
+      reject(new Error(`Auth failure: ${msg}`));
     });
 
     client.on('disconnected', async (reason) => {
@@ -344,13 +358,26 @@ async function restoreClient(userId, sessionId) {
       clients.delete(sessionId);
     });
 
-    await client.initialize();
-    clients.set(sessionId, client);
-    console.log(`✅ Client restored and stored for session ${sessionId}`);
-  } catch (error) {
-    console.error(`❌ Error restoring client for session ${sessionId}:`, error);
-    throw error;
-  }
+    // Initialize and store client immediately (ready event will fire later)
+    client.initialize().then(() => {
+      clients.set(sessionId, client);
+      console.log(`✅ Client restored and stored for session ${sessionId} (waiting for ready...)`);
+      // Don't resolve here - wait for 'ready' event
+    }).catch((error) => {
+      console.error(`❌ Error initializing restored client for session ${sessionId}:`, error);
+      clients.delete(sessionId);
+      reject(error);
+    });
+
+    // Timeout after 30 seconds if client doesn't become ready
+    setTimeout(() => {
+      if (!client.info) {
+        console.warn(`⚠️ Client for session ${sessionId} did not become ready within timeout`);
+        // Still resolve - client might become ready later
+        resolve(client);
+      }
+    }, 30000);
+  });
 }
 
 // Initialize WhatsApp client for a user
@@ -969,7 +996,7 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
       user_id: userId,
       session_id: sessionId,
       type: 'announcement',
-      recipients,
+      recipients: JSON.stringify(recipients), // Store as JSON string
       message,
       status: sent > 0 ? 'sent' : 'failed',
       error_message: errors.length > 0 ? JSON.stringify(errors) : null,
