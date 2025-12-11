@@ -74,20 +74,51 @@ DECLARE
   v_profile_complete BOOLEAN;
   v_session_created TIMESTAMP WITH TIME ZONE;
 BEGIN
-  -- Get account age
+  -- Get account age (calculate actual days using EPOCH for accuracy)
   SELECT created_at INTO v_session_created
   FROM whatsapp_sessions
   WHERE session_id = p_session_id;
   
-  v_account_age_days := COALESCE(EXTRACT(DAY FROM NOW() - v_session_created)::INTEGER, 0);
+  -- Calculate days as total seconds / seconds per day, then floor to integer
+  v_account_age_days := COALESCE(FLOOR(EXTRACT(EPOCH FROM (NOW() - v_session_created)) / 86400.0)::INTEGER, 0);
   
-  -- Count messages (using automation_logs as proxy)
+  -- Count messages accurately
+  -- For announcements, count the number of recipients from the JSON array
+  -- For OTP and API messages, count each as 1 message
   SELECT 
-    COUNT(*) FILTER (WHERE type IN ('otp', 'announcement', 'api_message')),
-    COUNT(DISTINCT recipient)
-  INTO v_total_sent, v_unique_contacts
+    COALESCE(SUM(
+      CASE 
+        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' THEN
+          -- Count recipients from JSON array (recipients is stored as TEXT JSON string)
+          jsonb_array_length(recipients::jsonb)
+        WHEN type IN ('otp', 'api_message', 'strengthening') THEN 1
+        ELSE 0
+      END
+    ), 0)
+  INTO v_total_sent
   FROM automation_logs
-  WHERE session_id = p_session_id AND status = 'sent';
+  WHERE session_id = p_session_id AND status = 'sent'
+    AND type IN ('otp', 'announcement', 'api_message', 'strengthening');
+  
+  -- Count unique contacts - need to expand announcements JSON arrays
+  WITH expanded_recipients AS (
+    SELECT 
+      CASE 
+        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' THEN
+          jsonb_array_elements_text(recipients::jsonb)::TEXT
+        ELSE recipient
+      END AS contact
+    FROM automation_logs
+    WHERE session_id = p_session_id 
+      AND status = 'sent'
+      AND type IN ('otp', 'announcement', 'api_message', 'strengthening')
+      AND (
+        (type = 'announcement' AND recipients IS NOT NULL AND recipients != '') 
+        OR (type != 'announcement' AND recipient IS NOT NULL)
+      )
+  )
+  SELECT COUNT(DISTINCT contact) INTO v_unique_contacts
+  FROM expanded_recipients;
   
   -- Calculate averages (simplified - would need more detailed tracking)
   v_avg_per_day := CASE 

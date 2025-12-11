@@ -1629,16 +1629,44 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      // Calculate account age accurately
       const accountAgeDays = Math.floor((new Date() - new Date(session.created_at)) / (1000 * 60 * 60 * 24));
       
+      // Get all logs to count messages accurately
       const { data: logs } = await supabase
         .from('automation_logs')
-        .select('recipient')
+        .select('type, recipient, recipients')
         .eq('session_id', sessionId)
-        .eq('status', 'sent');
+        .eq('status', 'sent')
+        .in('type', ['otp', 'announcement', 'api_message', 'strengthening']);
 
-      const totalSent = logs?.length || 0;
-      const uniqueContacts = new Set(logs?.map(l => l.recipient) || []).size;
+      // Count total messages accurately
+      let totalSent = 0;
+      const uniqueContactsSet = new Set();
+      
+      if (logs && logs.length > 0) {
+        for (const log of logs) {
+          if (log.type === 'announcement' && log.recipients) {
+            try {
+              const recipients = JSON.parse(log.recipients);
+              if (Array.isArray(recipients)) {
+                totalSent += recipients.length;
+                recipients.forEach(r => uniqueContactsSet.add(r));
+              }
+            } catch (e) {
+              // If JSON parse fails, count as 1
+              totalSent += 1;
+              if (log.recipient) uniqueContactsSet.add(log.recipient);
+            }
+          } else {
+            // For OTP, API messages, and strengthening - count as 1
+            totalSent += 1;
+            if (log.recipient) uniqueContactsSet.add(log.recipient);
+          }
+        }
+      }
+      
+      const uniqueContacts = uniqueContactsSet.size;
       const avgPerDay = accountAgeDays > 0 ? totalSent / accountAgeDays : 0;
       
       // Calculate basic score with improved formula
@@ -1707,31 +1735,18 @@ app.get('/api/account-strength/:userId/:sessionId/logs', async (req, res) => {
   }
 });
 
-// Start account strengthening service
-app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res) => {
+// Comprehensive account strengthening service (single button - performs all activities)
+app.post('/api/account-strength/:userId/:sessionId/strengthen-comprehensive', async (req, res) => {
   try {
     const { userId, sessionId } = req.params;
-    const { serviceType } = req.body;
-
-    if (!serviceType || !['profile_update', 'message_simulation', 'contact_sync', 'status_update', 'idle_period'].includes(serviceType)) {
-      return res.status(400).json({ error: 'Invalid service type' });
-    }
 
     const client = clients.get(sessionId);
     if (!client || !isClientReady(client)) {
       return res.status(400).json({ error: 'Session not ready. Please ensure your WhatsApp is connected.' });
     }
 
-    // Check wallet balance (strengthening costs vary)
-    const strengtheningCost = {
-      profile_update: 5,
-      message_simulation: 10,
-      contact_sync: 8,
-      status_update: 3,
-      idle_period: 2
-    };
-
-    const cost = strengtheningCost[serviceType] || 5;
+    // Comprehensive strengthening costs 25 IQD (combines all services)
+    const cost = 25;
 
     const { data: userProfile } = await supabase
       .from('user_profiles')
@@ -1748,13 +1763,13 @@ app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res)
       });
     }
 
-    // Create log entry
+    // Create log entry for comprehensive strengthening
     const { data: logEntry, error: logError } = await supabase
       .from('strengthening_logs')
       .insert({
         session_id: sessionId,
         user_id: userId,
-        service_type: serviceType,
+        service_type: 'comprehensive',
         service_status: 'pending',
         cost_iqd: cost
       })
@@ -1778,7 +1793,7 @@ app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res)
       amount: cost,
       balance_before: currentBalance,
       balance_after: currentBalance - cost,
-      description: `Account strengthening: ${serviceType}`,
+      description: `Comprehensive account strengthening (all activities)`,
       reference_id: `strengthen_${Date.now()}`
     });
 
@@ -1876,13 +1891,13 @@ app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res)
           break;
       }
       
-      // Log the activity to automation_logs for tracking
+      // Log the comprehensive activity to automation_logs for tracking
       await supabase.from('automation_logs').insert({
         user_id: userId,
         session_id: sessionId,
         type: 'strengthening',
-        recipient: serviceType,
-        message: `Strengthening service: ${serviceType}`,
+        recipient: 'comprehensive',
+        message: `Comprehensive account strengthening completed: ${activityDetails.completedSteps}/${activityDetails.totalSteps} steps`,
         status: 'sent'
       });
 
@@ -1917,9 +1932,12 @@ app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res)
 
       res.json({
         success: true,
-        message: 'Account strengthening completed successfully',
+        message: 'Comprehensive account strengthening completed successfully',
         logId: logEntry.id,
-        newBalance: currentBalance - cost
+        newBalance: currentBalance - cost,
+        activityDetails: activityDetails,
+        stepsCompleted: activityDetails.completedSteps,
+        totalSteps: activityDetails.totalSteps
       });
     } catch (activityError) {
       // Update log as failed
