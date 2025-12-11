@@ -831,18 +831,18 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
         // Continue with original chatId if resolution fails
       }
       
-      await client.sendMessage(chatId, message);
-      console.log('✅ OTP sent successfully');
+    await client.sendMessage(chatId, message);
+    console.log('✅ OTP sent successfully');
 
-      // Log to database
-      await supabase.from('automation_logs').insert({
-        user_id: userId,
-        session_id: sessionId,
-        type: 'otp',
-        recipient,
-        message: `OTP: ${otp}`,
-        status: 'sent',
-      });
+    // Log to database
+    await supabase.from('automation_logs').insert({
+      user_id: userId,
+      session_id: sessionId,
+      type: 'otp',
+      recipient,
+      message: `OTP: ${otp}`,
+      status: 'sent',
+    });
 
       res.json({ 
         success: true,
@@ -1592,6 +1592,374 @@ app.post('/api/api-keys/revoke/:userId/:sessionId', async (req, res) => {
   }
 });
 
+// ==================== ACCOUNT STRENGTH ENDPOINTS ====================
+
+// Get account strength metrics for a session
+app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
+  try {
+    const { userId, sessionId } = req.params;
+
+    // First, update the metrics by calling the database function
+    const { error: updateError } = await supabase.rpc('update_account_strength_metrics', {
+      p_session_id: sessionId
+    });
+
+    if (updateError) {
+      console.warn('⚠️ Could not update metrics (function might not exist yet):', updateError);
+      // Continue anyway - try to get existing metrics
+    }
+
+    // Get the metrics
+    const { data: metrics, error } = await supabase
+      .from('account_strength_metrics')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error || !metrics) {
+      // If no metrics exist, calculate basic ones
+      const { data: session } = await supabase
+        .from('whatsapp_sessions')
+        .select('created_at')
+        .eq('session_id', sessionId)
+        .single();
+
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      const accountAgeDays = Math.floor((new Date() - new Date(session.created_at)) / (1000 * 60 * 60 * 24));
+      
+      const { data: logs } = await supabase
+        .from('automation_logs')
+        .select('recipient')
+        .eq('session_id', sessionId)
+        .eq('status', 'sent');
+
+      const totalSent = logs?.length || 0;
+      const uniqueContacts = new Set(logs?.map(l => l.recipient) || []).size;
+      const avgPerDay = accountAgeDays > 0 ? totalSent / accountAgeDays : 0;
+      
+      // Calculate basic score
+      const strengthScore = Math.min(100, Math.max(0,
+        Math.min(30, accountAgeDays * 0.5) +
+        Math.min(25, (totalSent / 100.0) * 25) +
+        Math.min(20, (uniqueContacts / 50.0) * 20) +
+        10 // Profile assumed complete
+      ));
+
+      const banRisk = strengthScore >= 80 ? 'low' : 
+                     strengthScore >= 60 ? 'medium' : 
+                     strengthScore >= 40 ? 'high' : 'critical';
+
+      return res.json({
+        success: true,
+        metrics: {
+          account_age_days: accountAgeDays,
+          total_messages_sent: totalSent,
+          total_messages_received: 0,
+          unique_contacts_count: uniqueContacts,
+          avg_messages_per_day: parseFloat(avgPerDay.toFixed(2)),
+          max_messages_per_hour: 10,
+          engagement_rate: 0,
+          profile_complete: true,
+          strength_score: Math.round(strengthScore),
+          ban_risk_level: banRisk,
+          calculated_at: new Date().toISOString()
+        }
+      });
+    }
+
+    res.json({ success: true, metrics });
+  } catch (error) {
+    console.error('❌ Error fetching account strength:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get strengthening logs for a session
+app.get('/api/account-strength/:userId/:sessionId/logs', async (req, res) => {
+  try {
+    const { userId, sessionId } = req.params;
+    const limit = parseInt(req.query.limit) || 20;
+
+    const { data: logs, error } = await supabase
+      .from('strengthening_logs')
+      .select('*')
+      .eq('session_id', sessionId)
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, logs: logs || [] });
+  } catch (error) {
+    console.error('❌ Error fetching strengthening logs:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start account strengthening service
+app.post('/api/account-strength/:userId/:sessionId/strengthen', async (req, res) => {
+  try {
+    const { userId, sessionId } = req.params;
+    const { serviceType } = req.body;
+
+    if (!serviceType || !['profile_update', 'message_simulation', 'contact_sync', 'status_update', 'idle_period'].includes(serviceType)) {
+      return res.status(400).json({ error: 'Invalid service type' });
+    }
+
+    const client = clients.get(sessionId);
+    if (!client || !isClientReady(client)) {
+      return res.status(400).json({ error: 'Session not ready. Please ensure your WhatsApp is connected.' });
+    }
+
+    // Check wallet balance (strengthening costs vary)
+    const strengtheningCost = {
+      profile_update: 5,
+      message_simulation: 10,
+      contact_sync: 8,
+      status_update: 3,
+      idle_period: 2
+    };
+
+    const cost = strengtheningCost[serviceType] || 5;
+
+    const { data: userProfile } = await supabase
+      .from('user_profiles')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    const currentBalance = userProfile?.wallet_balance || 0;
+    if (currentBalance < cost) {
+      return res.status(402).json({
+        error: 'Insufficient balance',
+        currentBalance,
+        required: cost
+      });
+    }
+
+    // Create log entry
+    const { data: logEntry, error: logError } = await supabase
+      .from('strengthening_logs')
+      .insert({
+        session_id: sessionId,
+        user_id: userId,
+        service_type: serviceType,
+        service_status: 'pending',
+        cost_iqd: cost
+      })
+      .select()
+      .single();
+
+    if (logError) {
+      throw logError;
+    }
+
+    // Deduct balance
+    await supabase
+      .from('user_profiles')
+      .update({ wallet_balance: currentBalance - cost })
+      .eq('id', userId);
+
+    await supabase.from('wallet_transactions').insert({
+      user_id: userId,
+      session_id: sessionId,
+      transaction_type: 'debit',
+      amount: cost,
+      balance_before: currentBalance,
+      balance_after: currentBalance - cost,
+      description: `Account strengthening: ${serviceType}`,
+      reference_id: `strengthen_${Date.now()}`
+    });
+
+    // Perform strengthening activity
+    try {
+      switch (serviceType) {
+        case 'profile_update':
+          // Get profile picture (simulates profile activity)
+          await client.getProfilePicUrl(client.info.wid._serialized);
+          break;
+        case 'message_simulation':
+          // Get chats to simulate reading
+          const chats = await client.getChats();
+          if (chats.length > 0) {
+            const randomChat = chats[Math.floor(Math.random() * chats.length)];
+            await randomChat.fetchMessages({ limit: 1 });
+          }
+          break;
+        case 'contact_sync':
+          // Get contacts
+          await client.getContacts();
+          break;
+        case 'status_update':
+          // Check connection state
+          await client.getState();
+          break;
+        case 'idle_period':
+          // Just wait a bit (no action needed)
+          await new Promise(resolve => setTimeout(resolve, 1000));
+          break;
+      }
+
+      // Update log as completed
+      await supabase
+        .from('strengthening_logs')
+        .update({
+          service_status: 'completed',
+          completed_at: new Date().toISOString(),
+          service_details: { success: true, timestamp: new Date().toISOString() }
+        })
+        .eq('id', logEntry.id);
+
+      // Update last activity
+      await supabase
+        .from('whatsapp_sessions')
+        .update({ last_activity: new Date().toISOString() })
+        .eq('session_id', sessionId);
+
+      res.json({
+        success: true,
+        message: 'Account strengthening completed successfully',
+        logId: logEntry.id,
+        newBalance: currentBalance - cost
+      });
+    } catch (activityError) {
+      // Update log as failed
+      await supabase
+        .from('strengthening_logs')
+        .update({
+          service_status: 'failed',
+          completed_at: new Date().toISOString(),
+          service_details: { error: activityError.message }
+        })
+        .eq('id', logEntry.id);
+
+      throw activityError;
+    }
+  } catch (error) {
+    console.error('❌ Error in account strengthening:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Test message sending (from dashboard)
+app.post('/api/whatsapp/test-message', async (req, res) => {
+  try {
+    const { sessionId, recipient, message, userId } = req.body;
+
+    if (!sessionId || !recipient || !message || !userId) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const client = clients.get(sessionId);
+    if (!client) {
+      // Check if session exists and is being restored
+      const { data: sessionData } = await supabase
+        .from('whatsapp_sessions')
+        .select('status')
+        .eq('session_id', sessionId)
+        .single();
+
+      if (sessionData?.status === 'connected') {
+        return res.status(503).json({
+          error: 'Session is being restored. Please wait a moment and try again.',
+          sessionStatus: 'restoring'
+        });
+      }
+      return res.status(400).json({ error: 'WhatsApp session not found or disconnected' });
+    }
+
+    if (!isClientReady(client)) {
+      if (client && !client.info) {
+        return res.status(503).json({
+          error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
+          sessionStatus: 'initializing'
+        });
+      }
+      return res.status(400).json({ error: 'WhatsApp session is disconnected' });
+    }
+
+    // Check wallet balance
+    const { data: userProfile } = await supabase
+      .from('user_profiles')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    const currentBalance = userProfile?.wallet_balance || 0;
+    if (currentBalance < MESSAGE_COST_IQD) {
+      return res.status(402).json({
+        error: 'Insufficient balance',
+        currentBalance,
+        required: MESSAGE_COST_IQD
+      });
+    }
+
+    // Format phone number
+    const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
+    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
+
+    // Try to resolve number ID
+    try {
+      const numberId = await client.getNumberId(formattedNumber);
+      if (numberId) {
+        chatId = numberId._serialized;
+      }
+    } catch (lidError) {
+      console.log(`⚠️ Could not resolve number ID for ${formattedNumber}, trying direct send...`);
+    }
+
+    // Send message
+    await client.sendMessage(chatId, message);
+
+    // Deduct balance
+    const newBalance = currentBalance - MESSAGE_COST_IQD;
+    await supabase
+      .from('user_profiles')
+      .update({ wallet_balance: newBalance })
+      .eq('id', userId);
+
+    // Log transaction
+    await supabase.from('wallet_transactions').insert({
+      user_id: userId,
+      session_id: sessionId,
+      transaction_type: 'debit',
+      amount: MESSAGE_COST_IQD,
+      balance_before: currentBalance,
+      balance_after: newBalance,
+      description: `Test message to ${formattedNumber}`,
+      reference_id: `test_msg_${Date.now()}`
+    });
+
+    // Log in automation_logs
+    await supabase.from('automation_logs').insert({
+      user_id: userId,
+      session_id: sessionId,
+      type: 'api_message',
+      recipient: formattedNumber,
+      message: message,
+      status: 'sent'
+    });
+
+    res.json({
+      success: true,
+      message: 'Test message sent successfully',
+      recipient: formattedNumber,
+      balance: newBalance,
+      sentAt: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('❌ Error sending test message:', error);
+    res.status(500).json({ error: error.message || 'Failed to send test message' });
+  }
+});
+
 // Railway provides PORT, default to 5000 for local development
 const PORT = process.env.PORT || 5000;
 
@@ -1599,15 +1967,15 @@ const PORT = process.env.PORT || 5000;
 async function startServer() {
   // Restore active sessions before starting server
   await restoreActiveSessions();
-  
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log('');
-    console.log('🚀 Wassapi backend server running on port', PORT);
-    console.log('📍 Health check: http://localhost:' + PORT + '/health');
-    console.log('📍 Test endpoint: http://localhost:' + PORT + '/api/test');
-    console.log('🌐 Trust proxy enabled for Railway');
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('');
+  console.log('🚀 Wassapi backend server running on port', PORT);
+  console.log('📍 Health check: http://localhost:' + PORT + '/health');
+  console.log('📍 Test endpoint: http://localhost:' + PORT + '/api/test');
+  console.log('🌐 Trust proxy enabled for Railway');
     console.log(`📊 Active clients: ${clients.size}`);
-    console.log('');
+  console.log('');
   });
 }
 
