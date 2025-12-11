@@ -1,5 +1,6 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
@@ -124,12 +125,52 @@ async function initializeClient(userId, sessionId) {
       throw new Error('User already has a connected WhatsApp account');
     }
 
+    // Puppeteer configuration for Linux deployment
+    const puppeteerOptions = {
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-software-rasterizer',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding',
+        '--single-process', // Important for Railway/limited memory environments
+      ],
+    };
+
+    // Use system Chromium if available (for Railway/Docker deployments)
+    if (process.env.PUPPETEER_EXECUTABLE_PATH) {
+      puppeteerOptions.executablePath = process.env.PUPPETEER_EXECUTABLE_PATH;
+      console.log(`✅ Using Chromium from PUPPETEER_EXECUTABLE_PATH: ${process.env.PUPPETEER_EXECUTABLE_PATH}`);
+    } else if (process.platform === 'linux') {
+      // Try common Chromium paths on Linux
+      const chromiumPaths = [
+        '/usr/bin/chromium',
+        '/usr/bin/chromium-browser',
+        '/usr/bin/google-chrome',
+        '/usr/bin/google-chrome-stable',
+      ];
+      
+      for (const path of chromiumPaths) {
+        if (fs.existsSync(path)) {
+          puppeteerOptions.executablePath = path;
+          console.log(`✅ Using system Chromium at: ${path}`);
+          break;
+        }
+      }
+    }
+
     const client = new Client({
       authStrategy: new LocalAuth({ clientId: sessionId }),
-      puppeteer: {
-        headless: true,
-        args: ['--no-sandbox', '--disable-setuid-sandbox'],
-      },
+      puppeteer: puppeteerOptions,
     });
 
     let qrCodeData = null;
