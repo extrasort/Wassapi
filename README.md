@@ -1,81 +1,140 @@
-# Watani Shield Backend
+# Wassapi Backend
 
-Backend API for Watani Shield - WhatsApp account protection and automation service.
+WhatsApp backend service for Wassapi using WhatsApp Web.js.
 
-## Features
+## Setup
 
-- 🔐 JWT-based authentication
-- 📱 WhatsApp session management via QR codes
-- 🛡️ Account strengthening and protection
-- ⚡ OTP and announcement automation
-- 📊 Session monitoring and activity logging
-
-## Tech Stack
-
-- Node.js with Express
-- SQLite database
-- WhatsApp Web.js for WhatsApp integration
-- JWT for authentication
-- Rate limiting and security middleware
-
-## Environment Variables
-
-Create a `.env` file with:
-
-```env
-PORT=5000
-JWT_SECRET=your-super-secret-jwt-key-change-this-in-production-min-32-chars
-CLIENT_URL=https://your-frontend-domain.com
-NODE_ENV=production
-```
-
-## Installation
-
+1. Install dependencies:
 ```bash
 npm install
 ```
 
-## Development
-
-```bash
-npm run dev
+2. Create `.env` file:
+```env
+PORT=5000
+SUPABASE_URL=https://muefdflkgpmzvlihvghl.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your_service_role_key_here
 ```
 
-## Production
+3. Get Supabase Service Role Key:
+   - Go to Supabase Dashboard → Settings → API
+   - Copy the `service_role` key (NOT the anon key)
+   - This key has admin privileges and can bypass RLS
 
+4. Run the server:
 ```bash
 npm start
 ```
 
-## Railway Deployment
+For development with auto-reload:
+```bash
+npm run dev
+```
 
-This backend is configured for Railway deployment:
+## Features
 
-1. Connect this repository to Railway
-2. Set environment variables in Railway dashboard
-3. Railway will automatically detect and deploy
-
-See `railway.json` for configuration.
+- ✅ Real WhatsApp QR code generation
+- ✅ WhatsApp account connection
+- ✅ One account per user enforcement
+- ✅ OTP sending
+- ✅ Announcement sending
+- ✅ Session management
+- ✅ Automatic disconnection of old sessions
 
 ## API Endpoints
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login user
-- `GET /api/auth/me` - Get current user
+### POST /api/whatsapp/connect
+Connect a WhatsApp account.
 
-### WhatsApp
-- `POST /api/whatsapp/connect` - Create new WhatsApp session
-- `GET /api/whatsapp/sessions` - Get all user sessions
-- `GET /api/whatsapp/session/:sessionId` - Get session status
-- `POST /api/whatsapp/disconnect/:sessionId` - Disconnect session
+**Request:**
+```json
+{
+  "userId": "user-uuid",
+  "sessionId": "session-id"
+}
+```
 
-### Automation
-- `POST /api/automation/otp/send` - Send OTP message
-- `POST /api/automation/announcement/send` - Send bulk announcement
-- `GET /api/automation/messages/:sessionId` - Get message history
+**Response:**
+```json
+{
+  "success": true,
+  "sessionId": "session-id",
+  "qrCode": "data:image/png;base64,...",
+  "status": "connecting"
+}
+```
 
-## License
+### GET /api/whatsapp/session/:sessionId
+Get session status.
 
-MIT
+### POST /api/whatsapp/disconnect/:sessionId
+Disconnect a WhatsApp account.
+
+**Request:**
+```json
+{
+  "userId": "user-uuid"
+}
+```
+
+### POST /api/whatsapp/send-otp
+Send OTP via WhatsApp.
+
+**Request:**
+```json
+{
+  "sessionId": "session-id",
+  "recipient": "1234567890",
+  "otp": "123456",
+  "userId": "user-uuid"
+}
+```
+
+### POST /api/whatsapp/send-announcement
+Send announcement to multiple recipients.
+
+**Request:**
+```json
+{
+  "sessionId": "session-id",
+  "recipients": ["1234567890", "0987654321"],
+  "message": "Your message here",
+  "userId": "user-uuid"
+}
+```
+
+## Deployment
+
+### Railway
+1. Connect your GitHub repository
+2. Set environment variables
+3. Deploy
+
+### Other Platforms
+- Ensure Node.js 18+ is available
+- Set environment variables
+- Run `npm start`
+
+## Security Notes
+
+- ⚠️ Never expose `SUPABASE_SERVICE_ROLE_KEY` in frontend
+- ✅ Use environment variables
+- ✅ Keep `.env` in `.gitignore`
+- ✅ Use HTTPS in production
+
+## Troubleshooting
+
+### QR Code not showing
+- Check if backend is running
+- Verify Supabase credentials
+- Check browser console for errors
+
+### Connection fails
+- Ensure WhatsApp Web.js can access the internet
+- Check if port 5000 is available
+- Verify Supabase connection
+
+### Multiple accounts error
+- Backend automatically prevents multiple connections
+- Disconnect existing session first
 
