@@ -749,7 +749,31 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
     const client = clients.get(sessionId);
     if (!client) {
       console.error(`❌ Session ${sessionId} not found in active clients`);
-      return res.status(404).json({ error: 'Session not found. Please reconnect your WhatsApp account.' });
+      
+      // Check if session exists in database
+      const { data: session } = await supabase
+        .from('whatsapp_sessions')
+        .select('status')
+        .eq('session_id', sessionId)
+        .eq('user_id', userId)
+        .single();
+      
+      if (session) {
+        if (session.status === 'connected') {
+          // Session exists but wasn't restored - might still be initializing
+          return res.status(503).json({ 
+            error: 'Session is being restored. Please wait a moment and try again.',
+            sessionStatus: 'restoring'
+          });
+        } else {
+          return res.status(400).json({ 
+            error: `Session exists but is ${session.status}. Please reconnect your WhatsApp account via the dashboard.`,
+            sessionStatus: session.status
+          });
+        }
+      }
+      
+      return res.status(404).json({ error: 'Session not found. Please reconnect your WhatsApp account via the dashboard.' });
     }
 
     // Check if client is still ready
