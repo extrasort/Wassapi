@@ -754,6 +754,16 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
 
     // Check if client is still ready
     if (!isClientReady(client)) {
+      // Check if client exists but isn't ready yet (still initializing)
+      if (client && !client.info) {
+        console.log(`⏳ Client for session ${sessionId} is still initializing...`);
+        return res.status(503).json({ 
+          error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
+          sessionStatus: 'initializing'
+        });
+      }
+      
+      // Client is truly disconnected
       console.error(`❌ Client for session ${sessionId} is not ready or disconnected`);
       // Clean up the invalid client
       clients.delete(sessionId);
@@ -880,6 +890,16 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
 
     // Check if client is still ready
     if (!isClientReady(client)) {
+      // Check if client exists but isn't ready yet (still initializing)
+      if (client && !client.info) {
+        console.log(`⏳ Client for session ${sessionId} is still initializing...`);
+        return res.status(503).json({ 
+          error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
+          sessionStatus: 'initializing'
+        });
+      }
+      
+      // Client is truly disconnected
       console.error(`❌ Client for session ${sessionId} is not ready or disconnected`);
       // Clean up the invalid client
       clients.delete(sessionId);
