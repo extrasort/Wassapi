@@ -152,23 +152,31 @@ BEGIN
     AND type IN ('otp', 'announcement', 'api_message', 'strengthening');
   
   -- Count unique contacts
-  WITH expanded_recipients AS (
+  -- Use a safer approach with a function that handles JSONB parsing errors
+  WITH valid_logs AS (
     SELECT 
+      type,
+      recipient,
+      recipients,
       CASE 
         WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' THEN
-          -- Safely extract array elements
-          (SELECT jsonb_array_elements_text(recipients::jsonb)::TEXT
-           WHERE safe_jsonb_array_length(recipients) > 0)
-        ELSE recipient
-      END AS contact
+          safe_jsonb_array_length(recipients)
+        ELSE 0
+      END AS array_length
     FROM automation_logs
     WHERE session_id = p_session_id 
       AND status = 'sent'
       AND type IN ('otp', 'announcement', 'api_message', 'strengthening')
-      AND (
-        (type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND safe_jsonb_array_length(recipients) > 0) 
-        OR (type != 'announcement' AND recipient IS NOT NULL)
-      )
+  ),
+  expanded_recipients AS (
+    SELECT 
+      CASE 
+        WHEN type = 'announcement' AND array_length > 0 THEN
+          jsonb_array_elements_text(recipients::jsonb)::TEXT
+        ELSE recipient
+      END AS contact
+    FROM valid_logs
+    WHERE (type = 'announcement' AND array_length > 0) OR (type != 'announcement' AND recipient IS NOT NULL)
   )
   SELECT COUNT(DISTINCT contact) INTO v_unique_contacts
   FROM expanded_recipients
