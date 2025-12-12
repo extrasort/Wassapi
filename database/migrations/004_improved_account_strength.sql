@@ -80,6 +80,21 @@ CREATE TABLE IF NOT EXISTS activity_patterns (
 CREATE INDEX IF NOT EXISTS idx_activity_patterns_session_id ON activity_patterns(session_id);
 CREATE INDEX IF NOT EXISTS idx_activity_patterns_date ON activity_patterns(activity_date);
 
+-- Helper function to safely parse JSONB array
+CREATE OR REPLACE FUNCTION safe_jsonb_array_length(jsonb_text TEXT)
+RETURNS INTEGER AS $$
+BEGIN
+  BEGIN
+    IF jsonb_text IS NULL OR jsonb_text = '' THEN
+      RETURN 0;
+    END IF;
+    RETURN jsonb_array_length(jsonb_text::jsonb);
+  EXCEPTION WHEN OTHERS THEN
+    RETURN 0;
+  END;
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 -- Improved function to update account strength metrics with real-time data
 CREATE OR REPLACE FUNCTION update_account_strength_metrics_improved(p_session_id TEXT)
 RETURNS void AS $$
@@ -122,16 +137,11 @@ BEGIN
   v_account_age_days := COALESCE(FLOOR(EXTRACT(EPOCH FROM (NOW() - v_session_created)) / 86400.0)::INTEGER, 0);
   
   -- Count messages accurately
-  -- Use a subquery with error handling for JSONB parsing
   SELECT 
     COALESCE(SUM(
       CASE 
         WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' THEN
-          CASE 
-            WHEN jsonb_typeof(recipients::jsonb) = 'array' THEN
-              jsonb_array_length(recipients::jsonb)
-            ELSE 1
-          END
+          safe_jsonb_array_length(recipients)
         WHEN type IN ('otp', 'api_message', 'strengthening') THEN 1
         ELSE 0
       END
@@ -145,8 +155,10 @@ BEGIN
   WITH expanded_recipients AS (
     SELECT 
       CASE 
-        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND jsonb_typeof(recipients::jsonb) = 'array' THEN
-          jsonb_array_elements_text(recipients::jsonb)::TEXT
+        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' THEN
+          -- Safely extract array elements
+          (SELECT jsonb_array_elements_text(recipients::jsonb)::TEXT
+           WHERE safe_jsonb_array_length(recipients) > 0)
         ELSE recipient
       END AS contact
     FROM automation_logs
@@ -154,12 +166,13 @@ BEGIN
       AND status = 'sent'
       AND type IN ('otp', 'announcement', 'api_message', 'strengthening')
       AND (
-        (type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND jsonb_typeof(recipients::jsonb) = 'array') 
+        (type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND safe_jsonb_array_length(recipients) > 0) 
         OR (type != 'announcement' AND recipient IS NOT NULL)
       )
   )
   SELECT COUNT(DISTINCT contact) INTO v_unique_contacts
-  FROM expanded_recipients;
+  FROM expanded_recipients
+  WHERE contact IS NOT NULL;
   
   -- Calculate averages
   v_avg_per_day := CASE 
