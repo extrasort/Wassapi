@@ -122,11 +122,16 @@ BEGIN
   v_account_age_days := COALESCE(FLOOR(EXTRACT(EPOCH FROM (NOW() - v_session_created)) / 86400.0)::INTEGER, 0);
   
   -- Count messages accurately
+  -- Use a subquery with error handling for JSONB parsing
   SELECT 
     COALESCE(SUM(
       CASE 
-        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND recipients::text ~ '^\[.*\]$' THEN
-          jsonb_array_length(recipients::jsonb)
+        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' THEN
+          CASE 
+            WHEN jsonb_typeof(recipients::jsonb) = 'array' THEN
+              jsonb_array_length(recipients::jsonb)
+            ELSE 1
+          END
         WHEN type IN ('otp', 'api_message', 'strengthening') THEN 1
         ELSE 0
       END
@@ -140,7 +145,7 @@ BEGIN
   WITH expanded_recipients AS (
     SELECT 
       CASE 
-        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND recipients::text ~ '^\[.*\]$' THEN
+        WHEN type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND jsonb_typeof(recipients::jsonb) = 'array' THEN
           jsonb_array_elements_text(recipients::jsonb)::TEXT
         ELSE recipient
       END AS contact
@@ -149,7 +154,7 @@ BEGIN
       AND status = 'sent'
       AND type IN ('otp', 'announcement', 'api_message', 'strengthening')
       AND (
-        (type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND recipients::text ~ '^\[.*\]$') 
+        (type = 'announcement' AND recipients IS NOT NULL AND recipients != '' AND jsonb_typeof(recipients::jsonb) = 'array') 
         OR (type != 'announcement' AND recipient IS NOT NULL)
       )
   )
