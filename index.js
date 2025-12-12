@@ -372,6 +372,9 @@ async function restoreClient(userId, sessionId) {
                 // Ignore errors if table doesn't exist yet
               }
             }
+
+            // Setup incoming message handlers
+            setupIncomingMessageHandlers(client, session.user_id, sessionId);
             
             resolve(client);
           });
@@ -614,6 +617,9 @@ async function initializeClient(userId, sessionId) {
       } catch (apiError) {
         console.error('❌ Error in API key generation:', apiError);
       }
+
+      // Setup incoming message handlers
+      setupIncomingMessageHandlers(client, userId, sessionId);
     });
 
     client.on('authenticated', () => {
@@ -1846,6 +1852,108 @@ app.post('/api/api-keys/revoke/:userId/:sessionId', async (req, res) => {
 });
 
 // ==================== WEBHOOK HELPERS ====================
+
+// Setup incoming message handlers for a client
+function setupIncomingMessageHandlers(client, userId, sessionId) {
+  // Handle incoming messages
+  client.on('message', async (message) => {
+    try {
+      // Skip messages from status broadcasts
+      if (message.from === 'status@broadcast') {
+        return;
+      }
+
+      // Get message details
+      const from = message.from;
+      const body = message.body || '';
+      const hasMedia = message.hasMedia;
+      const type = message.type;
+      const timestamp = message.timestamp * 1000; // Convert to milliseconds
+      
+      // Determine message type and payload
+      let messageType = 'text';
+      let payload = {
+        success: true,
+        event: 'message_received',
+        from: from.replace('@c.us', ''),
+        timestamp: new Date(timestamp).toISOString(),
+        messageType: type,
+        hasMedia: hasMedia
+      };
+
+      // Handle different message types
+      if (type === 'location') {
+        messageType = 'location';
+        const location = message.location;
+        payload.location = {
+          latitude: location.latitude,
+          longitude: location.longitude,
+          name: location.name || null,
+          address: location.address || null
+        };
+      } else if (type === 'image' || type === 'video' || type === 'audio' || type === 'document') {
+        messageType = 'media';
+        payload.mediaType = type;
+        if (hasMedia) {
+          try {
+            const media = await message.downloadMedia();
+            payload.media = {
+              mimetype: media.mimetype,
+              data: media.data.substring(0, 100) + '...' // Truncate for webhook payload
+            };
+          } catch (e) {
+            console.error('Error downloading media:', e);
+          }
+        }
+      } else if (type === 'sticker') {
+        messageType = 'sticker';
+      } else if (type === 'voice') {
+        messageType = 'voice';
+      } else {
+        // Text message
+        messageType = 'text';
+        payload.text = body;
+      }
+
+      // Trigger webhooks for incoming messages
+      await triggerWebhooks(userId, sessionId, `incoming_${messageType}`, payload);
+      
+      // Also trigger generic incoming message webhook
+      await triggerWebhooks(userId, sessionId, 'incoming_message', {
+        ...payload,
+        messageType: messageType
+      });
+
+    } catch (error) {
+      console.error('Error handling incoming message:', error);
+    }
+  });
+
+  // Handle message acknowledgments (delivered, read)
+  client.on('message_ack', async (msg, ack) => {
+    try {
+      if (ack === 3) { // Read
+        await triggerWebhooks(userId, sessionId, 'message_read', {
+          success: true,
+          event: 'message_read',
+          messageId: msg.id._serialized,
+          from: msg.from.replace('@c.us', ''),
+          timestamp: new Date().toISOString()
+        });
+      } else if (ack === 2) { // Delivered
+        await triggerWebhooks(userId, sessionId, 'message_delivered', {
+          success: true,
+          event: 'message_delivered',
+          messageId: msg.id._serialized,
+          from: msg.from.replace('@c.us', ''),
+          timestamp: new Date().toISOString()
+        });
+      }
+    } catch (error) {
+      console.error('Error handling message ack:', error);
+    }
+  });
+}
 
 // Trigger webhooks for a given event (async, fire and forget)
 async function triggerWebhooks(userId, sessionId, eventType, payload) {
