@@ -2,6 +2,9 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const crypto = require('crypto');
+const https = require('https');
+const http = require('http');
+const { URL } = require('url');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
@@ -809,7 +812,8 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       });
     }
 
-    const message = `Your OTP code is: ${otp}`;
+    // Fixed OTP message format
+    const message = `رمز التحقق الخاص بك هو: ${otp}\n\nهذا الرمز صالح لمدة 10 دقائق. لا تشارك هذا الرمز مع أي شخص.\n\nYour verification code is: ${otp}\n\nThis code is valid for 10 minutes. Do not share this code with anyone.`;
     
     // Format phone number (remove any non-digits except +, then remove +)
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
@@ -849,6 +853,17 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
         balance: balanceCheck.balanceAfter,
         message: 'OTP sent successfully'
       });
+
+      // Trigger webhooks for successful OTP send (async, don't wait)
+      triggerWebhooks(userId, sessionId, 'otp', {
+        success: true,
+        event: 'otp_sent',
+        recipient: formattedNumber,
+        otp: otp,
+        timestamp: new Date().toISOString(),
+        message: 'OTP sent successfully'
+      }).catch(err => console.error('Webhook error (non-blocking):', err));
+
       } catch (sendError) {
       console.error('❌ Error sending OTP message:', sendError);
       
@@ -878,6 +893,16 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
         });
         console.log('💰 Balance refunded due to send failure');
       }
+
+      // Trigger webhooks for failed OTP send (async, don't wait)
+      triggerWebhooks(userId, sessionId, 'otp', {
+        success: false,
+        event: 'otp_failed',
+        recipient: formattedNumber,
+        otp: otp,
+        timestamp: new Date().toISOString(),
+        error: sendError.message || 'Failed to send OTP'
+      }).catch(err => console.error('Webhook error (non-blocking):', err));
       
       // If session is closed, clean up the client
       if (sendError.message && sendError.message.includes('Session closed')) {
@@ -1074,6 +1099,18 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     });
 
     console.log(`✅ Announcement sent: ${sent}/${recipients.length} successful`);
+
+    // Trigger webhooks for announcement (async, don't wait)
+    triggerWebhooks(userId, sessionId, 'announcement', {
+      success: sent > 0,
+      event: 'announcement_sent',
+      totalRecipients: recipients.length,
+      successfulSends: sent,
+      failedSends: errors.length,
+      errors: errors,
+      message: message,
+      timestamp: new Date().toISOString()
+    }).catch(err => console.error('Webhook error (non-blocking):', err));
     res.json({ 
       success: true, 
       sent, 
@@ -1195,6 +1232,133 @@ app.get('/api/v1/wallet/transactions', authenticateApiKey, async (req, res) => {
   } catch (error) {
     console.error('❌ Error fetching transactions:', error);
     res.status(500).json({ error: error.message });
+  }
+});
+
+// Send OTP via API Key (separate endpoint with fixed message format)
+app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
+  try {
+    const { recipient, otp } = req.body;
+
+    if (!recipient || !otp) {
+      return res.status(400).json({ error: 'recipient and otp are required' });
+    }
+
+    const client = clients.get(req.sessionId);
+    if (!client) {
+      return res.status(404).json({ error: 'WhatsApp session not found. Please reconnect via the dashboard.' });
+    }
+
+    if (!isClientReady(client)) {
+      if (client && !client.info) {
+        return res.status(503).json({ 
+          error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
+          sessionStatus: 'initializing'
+        });
+      }
+      return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
+    }
+
+    // Check and deduct balance
+    const balanceCheck = await deductBalance(req.userId, req.sessionId, `OTP sent to ${recipient} via API`, `api_otp_${Date.now()}`);
+    if (!balanceCheck.success) {
+      return res.status(402).json({
+        error: balanceCheck.error || 'Insufficient balance',
+        currentBalance: balanceCheck.currentBalance,
+        required: MESSAGE_COST_IQD
+      });
+    }
+
+    // Fixed OTP message format (bilingual)
+    const message = `رمز التحقق الخاص بك هو: ${otp}\n\nهذا الرمز صالح لمدة 10 دقائق. لا تشارك هذا الرمز مع أي شخص.\n\nYour verification code is: ${otp}\n\nThis code is valid for 10 minutes. Do not share this code with anyone.`;
+
+    // Format phone number
+    const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
+    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
+
+    try {
+      // Try to resolve number ID
+      let numberId;
+      try {
+        numberId = await client.getNumberId(formattedNumber);
+        if (numberId) {
+          chatId = numberId._serialized;
+        }
+      } catch (lidError) {
+        console.log(`⚠️ Could not resolve number ID for ${formattedNumber}, trying direct send...`);
+      }
+
+      await client.sendMessage(chatId, message);
+
+      // Log to database
+      await supabase.from('automation_logs').insert({
+        user_id: req.userId,
+        session_id: req.sessionId,
+        type: 'otp',
+        recipient: formattedNumber,
+        message: `OTP: ${otp}`,
+        status: 'sent',
+      });
+
+      // Trigger webhooks for successful OTP send (async, don't wait)
+      triggerWebhooks(req.userId, req.sessionId, 'otp', {
+        success: true,
+        event: 'otp_sent',
+        recipient: formattedNumber,
+        otp: otp,
+        timestamp: new Date().toISOString(),
+        message: 'OTP sent successfully via API'
+      }).catch(err => console.error('Webhook error (non-blocking):', err));
+
+      res.json({
+        success: true,
+        message: 'OTP sent successfully',
+        balance: balanceCheck.balanceAfter,
+        recipient: formattedNumber,
+        sentAt: new Date().toISOString()
+      });
+    } catch (sendError) {
+      // Refund balance if message failed
+      const { data: userProfile } = await supabase
+        .from('user_profiles')
+        .select('wallet_balance')
+        .eq('id', req.userId)
+        .single();
+      
+      if (userProfile && balanceCheck.success) {
+        const refundAmount = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+        await supabase
+          .from('user_profiles')
+          .update({ wallet_balance: refundAmount })
+          .eq('id', req.userId);
+        
+        await supabase.from('wallet_transactions').insert({
+          user_id: req.userId,
+          session_id: req.sessionId,
+          transaction_type: 'credit',
+          amount: MESSAGE_COST_IQD,
+          balance_before: balanceCheck.balanceAfter,
+          balance_after: refundAmount,
+          description: `Refund: Failed to send OTP to ${formattedNumber} via API`,
+          reference_id: `refund_api_otp_${Date.now()}`
+        });
+      }
+
+      // Trigger webhooks for failed OTP send (async, don't wait)
+      triggerWebhooks(req.userId, req.sessionId, 'otp', {
+        success: false,
+        event: 'otp_failed',
+        recipient: formattedNumber,
+        otp: otp,
+        timestamp: new Date().toISOString(),
+        error: sendError.message || 'Failed to send OTP via API'
+      }).catch(err => console.error('Webhook error (non-blocking):', err));
+
+      throw sendError;
+    }
+  } catch (error) {
+    console.error('❌ Error sending OTP via API:', error);
+    res.status(500).json({ error: error.message || 'Failed to send OTP. Please try again.' });
   }
 });
 
@@ -1592,6 +1756,448 @@ app.post('/api/api-keys/revoke/:userId/:sessionId', async (req, res) => {
   }
 });
 
+// ==================== WEBHOOK HELPERS ====================
+
+// Trigger webhooks for a given event (async, fire and forget)
+async function triggerWebhooks(userId, sessionId, eventType, payload) {
+  try {
+    // Get active webhooks for this user and session
+    const { data: webhooks, error } = await supabase
+      .from('webhooks')
+      .select('*')
+      .eq('user_id', userId)
+      .eq('session_id', sessionId)
+      .eq('is_active', true)
+      .in('webhook_type', [eventType, 'all']);
+
+    if (error || !webhooks || webhooks.length === 0) {
+      return; // No webhooks configured
+    }
+
+    // Trigger each webhook
+    for (const webhook of webhooks) {
+      // Determine which URL to use
+      let webhookUrl = webhook.webhook_url;
+      if (payload.success && webhook.success_webhook_url) {
+        webhookUrl = webhook.success_webhook_url;
+      } else if (!payload.success && webhook.failure_webhook_url) {
+        webhookUrl = webhook.failure_webhook_url;
+      }
+
+      if (!webhookUrl) continue;
+
+      // Merge custom payload with default payload
+      const finalPayload = {
+        ...payload,
+        ...(webhook.custom_payload || {})
+      };
+
+      // Call webhook asynchronously (don't block)
+      callWebhook(webhook.id, userId, sessionId, webhook, webhookUrl, payload, finalPayload)
+        .catch(err => console.error(`Webhook ${webhook.id} call failed:`, err.message));
+    }
+  } catch (error) {
+    console.error('Error triggering webhooks:', error);
+  }
+}
+
+// Call a single webhook with retry logic
+async function callWebhook(webhookId, userId, sessionId, webhookConfig, url, originalPayload, payload) {
+  const maxRetries = webhookConfig.max_retries || 3;
+  const retryDelay = (webhookConfig.retry_delay_seconds || 5) * 1000;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const isRetry = attempt > 1;
+      const result = await makeWebhookRequest(url, payload, webhookConfig.headers || {});
+
+      // Log successful call
+      await supabase.from('webhook_logs').insert({
+        webhook_id: webhookId,
+        user_id: userId,
+        session_id: sessionId,
+        event_type: originalPayload.event || 'unknown',
+        payload: payload,
+        response_status: result.status,
+        response_body: result.body?.substring(0, 1000), // Limit response body
+        success: true,
+        attempt_number: attempt,
+        is_retry: isRetry
+      });
+
+      // Update webhook stats
+      await supabase.rpc('update_webhook_stats', {
+        p_webhook_id: webhookId,
+        p_success: true
+      });
+
+      return result; // Success, exit retry loop
+    } catch (error) {
+      const isLastAttempt = attempt === maxRetries;
+
+      // Log failed call
+      await supabase.from('webhook_logs').insert({
+        webhook_id: webhookId,
+        user_id: userId,
+        session_id: sessionId,
+        event_type: originalPayload.event || 'unknown',
+        payload: payload,
+        response_status: error.status || null,
+        response_body: error.message?.substring(0, 1000),
+        success: false,
+        error_message: error.message,
+        attempt_number: attempt,
+        is_retry: attempt > 1
+      });
+
+      if (isLastAttempt) {
+        // Update webhook stats for final failure
+        await supabase.rpc('update_webhook_stats', {
+          p_webhook_id: webhookId,
+          p_success: false
+        });
+        throw error;
+      }
+
+      // Wait before retry
+      if (webhookConfig.retry_on_failure !== false) {
+        await new Promise(resolve => setTimeout(resolve, retryDelay));
+      }
+    }
+  }
+}
+
+// Make HTTP/HTTPS request to webhook URL
+function makeWebhookRequest(url, payload, headers) {
+  return new Promise((resolve, reject) => {
+    try {
+      const urlObj = new URL(url);
+      const isHttps = urlObj.protocol === 'https:';
+      const httpModule = isHttps ? https : http;
+
+      const defaultHeaders = {
+        'Content-Type': 'application/json',
+        'User-Agent': 'Wassapi-Webhook/1.0'
+      };
+
+      const finalHeaders = {
+        ...defaultHeaders,
+        ...headers
+      };
+
+      const postData = JSON.stringify(payload);
+
+      const options = {
+        hostname: urlObj.hostname,
+        port: urlObj.port || (isHttps ? 443 : 80),
+        path: urlObj.pathname + urlObj.search,
+        method: 'POST',
+        headers: {
+          ...finalHeaders,
+          'Content-Length': Buffer.byteLength(postData)
+        },
+        timeout: 10000 // 10 second timeout
+      };
+
+      const req = httpModule.request(options, (res) => {
+        let body = '';
+        res.setEncoding('utf8');
+        res.on('data', (chunk) => { body += chunk; });
+        res.on('end', () => {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ status: res.statusCode, body });
+          } else {
+            reject(new Error(`Webhook returned status ${res.statusCode}: ${body.substring(0, 200)}`));
+          }
+        });
+      });
+
+      req.on('error', (error) => {
+        reject(new Error(`Webhook request failed: ${error.message}`));
+      });
+
+      req.on('timeout', () => {
+        req.destroy();
+        reject(new Error('Webhook request timeout'));
+      });
+
+      req.write(postData);
+      req.end();
+    } catch (error) {
+      reject(error);
+    }
+  });
+}
+
+// ==================== WEBHOOK ENDPOINTS ====================
+
+// Get webhooks for user/session
+app.get('/api/webhooks/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const sessionId = req.query.sessionId;
+
+    let query = supabase
+      .from('webhooks')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false });
+
+    if (sessionId) {
+      query = query.eq('session_id', sessionId);
+    }
+
+    const { data: webhooks, error } = await query;
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, webhooks: webhooks || [] });
+  } catch (error) {
+    console.error('❌ Error fetching webhooks:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get webhook by ID
+app.get('/api/webhooks/:userId/:webhookId', async (req, res) => {
+  try {
+    const { userId, webhookId } = req.params;
+
+    const { data: webhook, error } = await supabase
+      .from('webhooks')
+      .select('*')
+      .eq('id', webhookId)
+      .eq('user_id', userId)
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    if (!webhook) {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    res.json({ success: true, webhook });
+  } catch (error) {
+    console.error('❌ Error fetching webhook:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create webhook
+app.post('/api/webhooks/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { sessionId, webhookUrl, webhookType, customPayload, successWebhookUrl, failureWebhookUrl, headers, retryOnFailure, maxRetries, retryDelaySeconds } = req.body;
+
+    if (!sessionId || !webhookUrl || !webhookType) {
+      return res.status(400).json({ error: 'sessionId, webhookUrl, and webhookType are required' });
+    }
+
+    // Validate webhook URL
+    try {
+      new URL(webhookUrl);
+    } catch {
+      return res.status(400).json({ error: 'Invalid webhook URL format' });
+    }
+
+    // Verify session belongs to user
+    const { data: session } = await supabase
+      .from('whatsapp_sessions')
+      .select('session_id')
+      .eq('session_id', sessionId)
+      .eq('user_id', userId)
+      .single();
+
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const { data: webhook, error } = await supabase
+      .from('webhooks')
+      .insert({
+        user_id: userId,
+        session_id: sessionId,
+        webhook_url: webhookUrl,
+        webhook_type: webhookType,
+        custom_payload: customPayload || {},
+        success_webhook_url: successWebhookUrl || null,
+        failure_webhook_url: failureWebhookUrl || null,
+        headers: headers || { 'Content-Type': 'application/json' },
+        retry_on_failure: retryOnFailure !== undefined ? retryOnFailure : true,
+        max_retries: maxRetries || 3,
+        retry_delay_seconds: retryDelaySeconds || 5
+      })
+      .select()
+      .single();
+
+    if (error) {
+      if (error.code === '23505') { // Unique constraint violation
+        return res.status(409).json({ error: 'Webhook already exists for this session and type' });
+      }
+      throw error;
+    }
+
+    res.json({ success: true, webhook });
+  } catch (error) {
+    console.error('❌ Error creating webhook:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update webhook
+app.put('/api/webhooks/:userId/:webhookId', async (req, res) => {
+  try {
+    const { userId, webhookId } = req.params;
+    const { webhookUrl, webhookType, customPayload, successWebhookUrl, failureWebhookUrl, headers, isActive, retryOnFailure, maxRetries, retryDelaySeconds } = req.body;
+
+    // Verify webhook belongs to user
+    const { data: existingWebhook } = await supabase
+      .from('webhooks')
+      .select('id')
+      .eq('id', webhookId)
+      .eq('user_id', userId)
+      .single();
+
+    if (!existingWebhook) {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    const updateData = {};
+    if (webhookUrl !== undefined) {
+      try {
+        new URL(webhookUrl);
+        updateData.webhook_url = webhookUrl;
+      } catch {
+        return res.status(400).json({ error: 'Invalid webhook URL format' });
+      }
+    }
+    if (webhookType !== undefined) updateData.webhook_type = webhookType;
+    if (customPayload !== undefined) updateData.custom_payload = customPayload;
+    if (successWebhookUrl !== undefined) updateData.success_webhook_url = successWebhookUrl || null;
+    if (failureWebhookUrl !== undefined) updateData.failure_webhook_url = failureWebhookUrl || null;
+    if (headers !== undefined) updateData.headers = headers;
+    if (isActive !== undefined) updateData.is_active = isActive;
+    if (retryOnFailure !== undefined) updateData.retry_on_failure = retryOnFailure;
+    if (maxRetries !== undefined) updateData.max_retries = maxRetries;
+    if (retryDelaySeconds !== undefined) updateData.retry_delay_seconds = retryDelaySeconds;
+    updateData.updated_at = new Date().toISOString();
+
+    const { data: webhook, error } = await supabase
+      .from('webhooks')
+      .update(updateData)
+      .eq('id', webhookId)
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, webhook });
+  } catch (error) {
+    console.error('❌ Error updating webhook:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Delete webhook
+app.delete('/api/webhooks/:userId/:webhookId', async (req, res) => {
+  try {
+    const { userId, webhookId } = req.params;
+
+    const { error } = await supabase
+      .from('webhooks')
+      .delete()
+      .eq('id', webhookId)
+      .eq('user_id', userId);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, message: 'Webhook deleted successfully' });
+  } catch (error) {
+    console.error('❌ Error deleting webhook:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get webhook logs
+app.get('/api/webhooks/:userId/:webhookId/logs', async (req, res) => {
+  try {
+    const { userId, webhookId } = req.params;
+    const limit = parseInt(req.query.limit) || 50;
+
+    // Verify webhook belongs to user
+    const { data: webhook } = await supabase
+      .from('webhooks')
+      .select('id')
+      .eq('id', webhookId)
+      .eq('user_id', userId)
+      .single();
+
+    if (!webhook) {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    const { data: logs, error } = await supabase
+      .from('webhook_logs')
+      .select('*')
+      .eq('webhook_id', webhookId)
+      .order('created_at', { ascending: false })
+      .limit(limit);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, logs: logs || [] });
+  } catch (error) {
+    console.error('❌ Error fetching webhook logs:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Test webhook (sends a test payload)
+app.post('/api/webhooks/:userId/:webhookId/test', async (req, res) => {
+  try {
+    const { userId, webhookId } = req.params;
+
+    const { data: webhook, error: fetchError } = await supabase
+      .from('webhooks')
+      .select('*')
+      .eq('id', webhookId)
+      .eq('user_id', userId)
+      .single();
+
+    if (fetchError || !webhook) {
+      return res.status(404).json({ error: 'Webhook not found' });
+    }
+
+    const testPayload = {
+      success: true,
+      event: 'webhook_test',
+      timestamp: new Date().toISOString(),
+      message: 'This is a test webhook from Wassapi',
+      ...(webhook.custom_payload || {})
+    };
+
+    try {
+      await callWebhook(webhookId, userId, webhook.session_id, webhook, webhook.webhook_url, testPayload, testPayload);
+      res.json({ success: true, message: 'Test webhook sent successfully' });
+    } catch (error) {
+      res.status(500).json({ error: `Webhook test failed: ${error.message}` });
+    }
+  } catch (error) {
+    console.error('❌ Error testing webhook:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== ACCOUNT STRENGTH ENDPOINTS ====================
 
 // Get account strength metrics for a session
@@ -1797,98 +2403,151 @@ app.post('/api/account-strength/:userId/:sessionId/strengthen-comprehensive', as
       reference_id: `strengthen_${Date.now()}`
     });
 
-    // Perform strengthening activity
+    // Perform comprehensive strengthening activities sequentially
     try {
-      let activityDetails = {};
+      const serviceTypes = ['profile_update', 'message_simulation', 'contact_sync', 'status_update', 'idle_period'];
+      let activityDetails = {
+        totalSteps: serviceTypes.length,
+        completedSteps: 0,
+        steps: []
+      };
       
-      switch (serviceType) {
-        case 'profile_update':
-          // Get profile picture and info (simulates profile activity)
-          try {
-            const profilePic = await client.getProfilePicUrl(client.info.wid._serialized);
-            const info = client.info;
-            activityDetails = {
-              profilePicFetched: !!profilePic,
-              profileName: info.pushname || '',
-              timestamp: new Date().toISOString()
-            };
-            // Also update "last seen" by checking state
-            await client.getState();
-          } catch (err) {
-            console.log('Profile update activity:', err.message);
-          }
-          break;
+      for (const serviceType of serviceTypes) {
+        try {
+          let stepDetails = { type: serviceType, status: 'completed' };
           
-        case 'message_simulation':
-          // Get chats and actually read multiple messages to simulate real activity
-          const chats = await client.getChats();
-          activityDetails.chatsFound = chats.length;
-          
-          if (chats.length > 0) {
-            // Read messages from up to 3 random chats
-            const chatsToRead = chats
-              .sort(() => 0.5 - Math.random())
-              .slice(0, Math.min(3, chats.length));
-            
-            for (const chat of chatsToRead) {
+          switch (serviceType) {
+            case 'profile_update':
+              // Get profile picture and info (simulates profile activity)
               try {
-                // Fetch recent messages (simulates reading)
-                const messages = await chat.fetchMessages({ limit: 5 });
-                
-                // Mark as read if possible
-                try {
-                  if (messages.length > 0 && chat.unreadCount > 0) {
-                    await chat.markSeen();
-                  }
-                } catch (readErr) {
-                  // Ignore read errors
-                }
-              } catch (msgErr) {
-                console.log('Error reading chat:', msgErr.message);
+                const profilePic = await client.getProfilePicUrl(client.info.wid._serialized);
+                const info = client.info;
+                stepDetails.details = {
+                  profilePicFetched: !!profilePic,
+                  profileName: info.pushname || '',
+                  timestamp: new Date().toISOString()
+                };
+                // Also update "last seen" by checking state
+                await client.getState();
+              } catch (err) {
+                console.log('Profile update activity:', err.message);
+                stepDetails.status = 'failed';
+                stepDetails.error = err.message;
               }
-            }
-            
-            activityDetails.chatsRead = chatsToRead.length;
-            activityDetails.messagesRead = chatsToRead.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+              break;
+              
+            case 'message_simulation':
+              // Get chats and actually read multiple messages to simulate real activity
+              try {
+                const chats = await client.getChats();
+                stepDetails.details = { chatsFound: chats.length };
+                
+                if (chats.length > 0) {
+                  // Read messages from up to 3 random chats
+                  const chatsToRead = chats
+                    .sort(() => 0.5 - Math.random())
+                    .slice(0, Math.min(3, chats.length));
+                  
+                  for (const chat of chatsToRead) {
+                    try {
+                      // Fetch recent messages (simulates reading)
+                      const messages = await chat.fetchMessages({ limit: 5 });
+                      
+                      // Mark as read if possible
+                      try {
+                        if (messages.length > 0 && chat.unreadCount > 0) {
+                          await chat.markSeen();
+                        }
+                      } catch (readErr) {
+                        // Ignore read errors
+                      }
+                    } catch (msgErr) {
+                      console.log('Error reading chat:', msgErr.message);
+                    }
+                  }
+                  
+                  stepDetails.details.chatsRead = chatsToRead.length;
+                  stepDetails.details.messagesRead = chatsToRead.reduce((sum, c) => sum + (c.unreadCount || 0), 0);
+                }
+              } catch (err) {
+                console.log('Message simulation activity:', err.message);
+                stepDetails.status = 'failed';
+                stepDetails.error = err.message;
+              }
+              break;
+              
+            case 'contact_sync':
+              // Get and cache contacts (simulates contact sync activity)
+              try {
+                const contacts = await client.getContacts();
+                stepDetails.details = { contactsCount: contacts.length };
+                
+                // Also get block list to show account is active
+                try {
+                  const blockedContacts = await client.getBlockedContacts();
+                  stepDetails.details.blockedCount = blockedContacts.length;
+                } catch (err) {
+                  // Blocked contacts might not be available
+                }
+              } catch (err) {
+                console.log('Contact sync activity:', err.message);
+                stepDetails.status = 'failed';
+                stepDetails.error = err.message;
+              }
+              break;
+              
+            case 'status_update':
+              // Check connection state and get account info (shows active presence)
+              try {
+                const state = await client.getState();
+                const accountInfo = client.info;
+                
+                stepDetails.details = {
+                  state: state,
+                  accountActive: state === 'CONNECTED',
+                  pushName: accountInfo.pushname || ''
+                };
+                
+                // Also fetch chats count to show activity
+                const allChats = await client.getChats();
+                stepDetails.details.totalChats = allChats.length;
+              } catch (err) {
+                console.log('Status update activity:', err.message);
+                stepDetails.status = 'failed';
+                stepDetails.error = err.message;
+              }
+              break;
+              
+            case 'idle_period':
+              // Simulate idle by doing minimal activity after delay
+              try {
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                // Check state to show we're still connected
+                const idleState = await client.getState();
+                stepDetails.details = {
+                  idlePeriodSeconds: 2,
+                  stateDuringIdle: idleState
+                };
+              } catch (err) {
+                console.log('Idle period activity:', err.message);
+                stepDetails.status = 'failed';
+                stepDetails.error = err.message;
+              }
+              break;
           }
-          break;
           
-        case 'contact_sync':
-          // Get and cache contacts (simulates contact sync activity)
-          const contacts = await client.getContacts();
-          activityDetails.contactsCount = contacts.length;
-          
-          // Also get block list to show account is active
-          try {
-            const blockedContacts = await client.getBlockedContacts();
-            activityDetails.blockedCount = blockedContacts.length;
-          } catch (err) {
-            // Blocked contacts might not be available
+          activityDetails.steps.push(stepDetails);
+          if (stepDetails.status === 'completed') {
+            activityDetails.completedSteps++;
           }
-          break;
-          
-        case 'status_update':
-          // Check connection state and get account info (shows active presence)
-          const state = await client.getState();
-          const accountInfo = client.info;
-          
-          activityDetails.state = state;
-          activityDetails.accountActive = state === 'CONNECTED';
-          activityDetails.pushName = accountInfo.pushname || '';
-          
-          // Also fetch chats count to show activity
-          const allChats = await client.getChats();
-          activityDetails.totalChats = allChats.length;
-          break;
-          
-        case 'idle_period':
-          // Simulate idle by doing minimal activity after delay
-          await new Promise(resolve => setTimeout(resolve, 2000));
-          // Check state to show we're still connected
-          const idleState = await client.getState();
-          activityDetails.idlePeriodSeconds = 2;
-          activityDetails.stateDuringIdle = idleState;
-          break;
+        } catch (stepError) {
+          console.log(`Error in ${serviceType}:`, stepError.message);
+          activityDetails.steps.push({
+            type: serviceType,
+            status: 'failed',
+            error: stepError.message
+          });
+        }
       }
       
       // Log the comprehensive activity to automation_logs for tracking
