@@ -48,8 +48,7 @@ CREATE TABLE IF NOT EXISTS message_delivery_tracking (
 CREATE INDEX IF NOT EXISTS idx_message_delivery_session_id ON message_delivery_tracking(session_id);
 CREATE INDEX IF NOT EXISTS idx_message_delivery_user_id ON message_delivery_tracking(user_id);
 CREATE INDEX IF NOT EXISTS idx_message_delivery_status ON message_delivery_tracking(status);
-CREATE INDEX IF NOT EXISTS idx_message_delivery_sent_at ON message_delivery_tracking(sent_at)
-);
+CREATE INDEX IF NOT EXISTS idx_message_delivery_sent_at ON message_delivery_tracking(sent_at);
 
 -- Create table to track connection events
 CREATE TABLE IF NOT EXISTS connection_events (
@@ -63,8 +62,7 @@ CREATE TABLE IF NOT EXISTS connection_events (
 );
 
 CREATE INDEX IF NOT EXISTS idx_connection_events_session_id ON connection_events(session_id);
-CREATE INDEX IF NOT EXISTS idx_connection_events_created_at ON connection_events(created_at)
-);
+CREATE INDEX IF NOT EXISTS idx_connection_events_created_at ON connection_events(created_at);
 
 -- Create table to track activity patterns
 CREATE TABLE IF NOT EXISTS activity_patterns (
@@ -81,8 +79,7 @@ CREATE TABLE IF NOT EXISTS activity_patterns (
 );
 
 CREATE INDEX IF NOT EXISTS idx_activity_patterns_session_id ON activity_patterns(session_id);
-CREATE INDEX IF NOT EXISTS idx_activity_patterns_date ON activity_patterns(activity_date)
-);
+CREATE INDEX IF NOT EXISTS idx_activity_patterns_date ON activity_patterns(activity_date);
 
 -- Improved function to update account strength metrics with real-time data
 CREATE OR REPLACE FUNCTION update_account_strength_metrics_improved(p_session_id TEXT)
