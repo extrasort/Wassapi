@@ -57,8 +57,7 @@ CREATE TABLE IF NOT EXISTS connection_events (
   user_id UUID NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   event_type TEXT NOT NULL, -- 'connected', 'disconnected', 'reconnecting', 'error'
   event_details JSONB,
-  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-  
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
 CREATE INDEX IF NOT EXISTS idx_connection_events_session_id ON connection_events(session_id);
