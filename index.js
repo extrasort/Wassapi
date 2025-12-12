@@ -357,16 +357,20 @@ async function restoreClient(userId, sessionId) {
               .single();
             
             if (session) {
-              await supabase.from('connection_events').insert({
-                session_id: sessionId,
-                user_id: session.user_id,
-                event_type: 'connected',
-                event_details: { 
-                  state: 'CONNECTED',
-                  phone: info.wid.user,
-                  timestamp: new Date().toISOString() 
-                }
-              }).catch(() => {}); // Ignore errors if table doesn't exist yet
+              try {
+                await supabase.from('connection_events').insert({
+                  session_id: sessionId,
+                  user_id: session.user_id,
+                  event_type: 'connected',
+                  event_details: { 
+                    state: 'CONNECTED',
+                    phone: info.wid.user,
+                    timestamp: new Date().toISOString() 
+                  }
+                });
+              } catch (e) {
+                // Ignore errors if table doesn't exist yet
+              }
             }
             
             resolve(client);
@@ -1468,35 +1472,45 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
       
       // Track message delivery (initial status: sent)
       if (messageResult && messageResult.id) {
-        await supabase.from('message_delivery_tracking').insert({
-          session_id: req.sessionId,
-          user_id: req.userId,
-          message_id: messageResult.id._serialized || messageResult.id.toString(),
-          recipient: formattedNumber,
-          status: 'sent',
-          sent_at: new Date().toISOString()
-        }).catch(() => {}); // Ignore errors if table doesn't exist yet
+        try {
+          await supabase.from('message_delivery_tracking').insert({
+            session_id: req.sessionId,
+            user_id: req.userId,
+            message_id: messageResult.id._serialized || messageResult.id.toString(),
+            recipient: formattedNumber,
+            status: 'sent',
+            sent_at: new Date().toISOString()
+          });
+        } catch (e) {
+          // Ignore errors if table doesn't exist yet
+        }
         
         // Set up delivery tracking listeners (if message object supports it)
         if (messageResult.on) {
           messageResult.on('delivery', async () => {
-            await supabase.from('message_delivery_tracking')
-              .update({ 
-                status: 'delivered',
-                delivered_at: new Date().toISOString()
-              })
-              .eq('message_id', messageResult.id._serialized || messageResult.id.toString())
-              .catch(() => {});
+            try {
+              await supabase.from('message_delivery_tracking')
+                .update({ 
+                  status: 'delivered',
+                  delivered_at: new Date().toISOString()
+                })
+                .eq('message_id', messageResult.id._serialized || messageResult.id.toString());
+            } catch (e) {
+              // Ignore errors
+            }
           });
           
           messageResult.on('read', async () => {
-            await supabase.from('message_delivery_tracking')
-              .update({ 
-                status: 'read',
-                read_at: new Date().toISOString()
-              })
-              .eq('message_id', messageResult.id._serialized || messageResult.id.toString())
-              .catch(() => {});
+            try {
+              await supabase.from('message_delivery_tracking')
+                .update({ 
+                  status: 'read',
+                  read_at: new Date().toISOString()
+                })
+                .eq('message_id', messageResult.id._serialized || messageResult.id.toString());
+            } catch (e) {
+              // Ignore errors
+            }
           });
         }
       }
@@ -2324,12 +2338,16 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
         
         // Log connection event if connected
         if (state === 'CONNECTED') {
-          await supabase.from('connection_events').insert({
-            session_id: sessionId,
-            user_id: userId,
-            event_type: 'connected',
-            event_details: { state, timestamp: new Date().toISOString() }
-          }).catch(() => {}); // Ignore errors if table doesn't exist yet
+          try {
+            await supabase.from('connection_events').insert({
+              session_id: sessionId,
+              user_id: userId,
+              event_type: 'connected',
+              event_details: { state, timestamp: new Date().toISOString() }
+            });
+          } catch (e) {
+            // Ignore errors if table doesn't exist yet
+          }
         }
         
         // Track activity pattern (current hour)
@@ -2337,16 +2355,20 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
         const currentHour = now.getHours();
         const today = now.toISOString().split('T')[0];
         
-        await supabase.from('activity_patterns').upsert({
-          session_id: sessionId,
-          user_id: userId,
-          activity_date: today,
-          hour_of_day: currentHour,
-          message_count: 1
-        }, {
-          onConflict: 'session_id,activity_date,hour_of_day',
-          ignoreDuplicates: false
-        }).catch(() => {}); // Ignore errors if table doesn't exist yet
+        try {
+          await supabase.from('activity_patterns').upsert({
+            session_id: sessionId,
+            user_id: userId,
+            activity_date: today,
+            hour_of_day: currentHour,
+            message_count: 1
+          }, {
+            onConflict: 'session_id,activity_date,hour_of_day',
+            ignoreDuplicates: false
+          });
+        } catch (e) {
+          // Ignore errors if table doesn't exist yet
+        }
         
       } catch (realTimeError) {
         console.log('⚠️ Error collecting real-time metrics:', realTimeError.message);
@@ -2375,11 +2397,14 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
     
     // Update real-time metrics if we collected them
     if (Object.keys(realTimeMetrics).length > 0) {
-      await supabase
-        .from('account_strength_metrics')
-        .update(realTimeMetrics)
-        .eq('session_id', sessionId)
-        .catch(() => {}); // Ignore errors
+      try {
+        await supabase
+          .from('account_strength_metrics')
+          .update(realTimeMetrics)
+          .eq('session_id', sessionId);
+      } catch (e) {
+        // Ignore errors if table doesn't exist yet
+      }
     }
 
     // Get the metrics
