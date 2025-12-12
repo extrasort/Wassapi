@@ -328,29 +328,49 @@ async function restoreClient(userId, sessionId) {
     });
 
     // Set up event handlers
-    client.on('ready', async () => {
-      if (isResolved) return; // Already handled
-      
-      clearTimeout(timeoutId);
-      isResolved = true;
-      
-      console.log(`✅ WhatsApp client restored and ready for session ${sessionId}`);
-      const info = client.info;
-      console.log(`📱 Connected to: ${info.wid.user}`);
-      
-      // Store client in map if not already stored
-      clients.set(sessionId, client);
-      
-      await supabase
-        .from('whatsapp_sessions')
-        .update({ 
-          status: 'connected',
-          last_activity: new Date().toISOString() 
-        })
-        .eq('session_id', sessionId);
-      
-      resolve(client);
-    });
+          client.on('ready', async () => {
+            if (isResolved) return; // Already handled
+            
+            clearTimeout(timeoutId);
+            isResolved = true;
+            
+            console.log(`✅ WhatsApp client restored and ready for session ${sessionId}`);
+            const info = client.info;
+            console.log(`📱 Connected to: ${info.wid.user}`);
+            
+            // Store client in map if not already stored
+            clients.set(sessionId, client);
+            
+            await supabase
+              .from('whatsapp_sessions')
+              .update({ 
+                status: 'connected',
+                last_activity: new Date().toISOString() 
+              })
+              .eq('session_id', sessionId);
+            
+            // Log connection event
+            const { data: session } = await supabase
+              .from('whatsapp_sessions')
+              .select('user_id')
+              .eq('session_id', sessionId)
+              .single();
+            
+            if (session) {
+              await supabase.from('connection_events').insert({
+                session_id: sessionId,
+                user_id: session.user_id,
+                event_type: 'connected',
+                event_details: { 
+                  state: 'CONNECTED',
+                  phone: info.wid.user,
+                  timestamp: new Date().toISOString() 
+                }
+              }).catch(() => {}); // Ignore errors if table doesn't exist yet
+            }
+            
+            resolve(client);
+          });
 
     client.on('authenticated', () => {
       console.log(`✅ Authenticated for restored session ${sessionId}`);
@@ -370,14 +390,34 @@ async function restoreClient(userId, sessionId) {
       reject(new Error(`Auth failure: ${msg}`));
     });
 
-    client.on('disconnected', async (reason) => {
-      console.log(`⚠️ Disconnected for restored session ${sessionId}:`, reason);
-      await supabase
-        .from('whatsapp_sessions')
-        .update({ status: 'disconnected' })
-        .eq('session_id', sessionId);
-      clients.delete(sessionId);
-    });
+          client.on('disconnected', async (reason) => {
+            console.log(`⚠️ Disconnected for restored session ${sessionId}:`, reason);
+            await supabase
+              .from('whatsapp_sessions')
+              .update({ status: 'disconnected' })
+              .eq('session_id', sessionId);
+            
+            // Log disconnection event
+            const { data: session } = await supabase
+              .from('whatsapp_sessions')
+              .select('user_id')
+              .eq('session_id', sessionId)
+              .single();
+            
+            if (session) {
+              await supabase.from('connection_events').insert({
+                session_id: sessionId,
+                user_id: session.user_id,
+                event_type: 'disconnected',
+                event_details: { 
+                  reason: reason || 'unknown',
+                  timestamp: new Date().toISOString() 
+                }
+              }).catch(() => {}); // Ignore errors if table doesn't exist yet
+            }
+            
+            clients.delete(sessionId);
+          });
 
     // Initialize client
     client.initialize().then(() => {
@@ -1414,7 +1454,7 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
         // Continue with original chatId if resolution fails
       }
       
-      await client.sendMessage(chatId, message);
+      const messageResult = await client.sendMessage(chatId, message);
 
       // Log to database
       await supabase.from('automation_logs').insert({
@@ -1425,6 +1465,41 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
         message,
         status: 'sent',
       });
+      
+      // Track message delivery (initial status: sent)
+      if (messageResult && messageResult.id) {
+        await supabase.from('message_delivery_tracking').insert({
+          session_id: req.sessionId,
+          user_id: req.userId,
+          message_id: messageResult.id._serialized || messageResult.id.toString(),
+          recipient: formattedNumber,
+          status: 'sent',
+          sent_at: new Date().toISOString()
+        }).catch(() => {}); // Ignore errors if table doesn't exist yet
+        
+        // Set up delivery tracking listeners (if message object supports it)
+        if (messageResult.on) {
+          messageResult.on('delivery', async () => {
+            await supabase.from('message_delivery_tracking')
+              .update({ 
+                status: 'delivered',
+                delivered_at: new Date().toISOString()
+              })
+              .eq('message_id', messageResult.id._serialized || messageResult.id.toString())
+              .catch(() => {});
+          });
+          
+          messageResult.on('read', async () => {
+            await supabase.from('message_delivery_tracking')
+              .update({ 
+                status: 'read',
+                read_at: new Date().toISOString()
+              })
+              .eq('message_id', messageResult.id._serialized || messageResult.id.toString())
+              .catch(() => {});
+          });
+        }
+      }
 
       res.json({
         success: true,
@@ -2205,14 +2280,106 @@ app.get('/api/account-strength/:userId/:sessionId', async (req, res) => {
   try {
     const { userId, sessionId } = req.params;
 
-    // First, update the metrics by calling the database function
-    const { error: updateError } = await supabase.rpc('update_account_strength_metrics', {
-      p_session_id: sessionId
-    });
+    // Get WhatsApp client to collect real-time metrics
+    const client = clients.get(sessionId);
+    let realTimeMetrics = {};
+    
+    if (client && isClientReady(client)) {
+      try {
+        // Collect real-time profile data
+        const info = client.info;
+        const state = await client.getState();
+        
+        // Check profile picture
+        try {
+          const profilePic = await client.getProfilePicUrl(info.wid._serialized);
+          realTimeMetrics.profile_picture_exists = !!profilePic;
+        } catch (e) {
+          realTimeMetrics.profile_picture_exists = false;
+        }
+        
+        // Get profile name length
+        realTimeMetrics.profile_name_length = (info.pushname || '').length;
+        realTimeMetrics.profile_complete = !!(info.pushname && info.pushname.length > 0);
+        
+        // Get chats count
+        const chats = await client.getChats();
+        realTimeMetrics.total_chats_count = chats.length;
+        
+        // Count active chats (with messages in last 7 days)
+        const sevenDaysAgo = new Date();
+        sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7);
+        let activeChats = 0;
+        for (const chat of chats.slice(0, 50)) { // Limit to first 50 for performance
+          try {
+            const messages = await chat.fetchMessages({ limit: 1 });
+            if (messages.length > 0 && messages[0].timestamp * 1000 > sevenDaysAgo.getTime()) {
+              activeChats++;
+            }
+          } catch (e) {
+            // Skip if can't fetch
+          }
+        }
+        realTimeMetrics.active_chats_count = activeChats;
+        
+        // Log connection event if connected
+        if (state === 'CONNECTED') {
+          await supabase.from('connection_events').insert({
+            session_id: sessionId,
+            user_id: userId,
+            event_type: 'connected',
+            event_details: { state, timestamp: new Date().toISOString() }
+          }).catch(() => {}); // Ignore errors if table doesn't exist yet
+        }
+        
+        // Track activity pattern (current hour)
+        const now = new Date();
+        const currentHour = now.getHours();
+        const today = now.toISOString().split('T')[0];
+        
+        await supabase.from('activity_patterns').upsert({
+          session_id: sessionId,
+          user_id: userId,
+          activity_date: today,
+          hour_of_day: currentHour,
+          message_count: 1
+        }, {
+          onConflict: 'session_id,activity_date,hour_of_day',
+          ignoreDuplicates: false
+        }).catch(() => {}); // Ignore errors if table doesn't exist yet
+        
+      } catch (realTimeError) {
+        console.log('⚠️ Error collecting real-time metrics:', realTimeError.message);
+      }
+    }
+
+    // First, try to use improved function, fallback to original
+    let updateError = null;
+    try {
+      const { error } = await supabase.rpc('update_account_strength_metrics_improved', {
+        p_session_id: sessionId
+      });
+      updateError = error;
+    } catch (e) {
+      // If improved function doesn't exist, try original
+      const { error } = await supabase.rpc('update_account_strength_metrics', {
+        p_session_id: sessionId
+      });
+      updateError = error;
+    }
 
     if (updateError) {
-      console.warn('⚠️ Could not update metrics (function might not exist yet):', updateError);
+      console.warn('⚠️ Could not update metrics:', updateError);
       // Continue anyway - try to get existing metrics
+    }
+    
+    // Update real-time metrics if we collected them
+    if (Object.keys(realTimeMetrics).length > 0) {
+      await supabase
+        .from('account_strength_metrics')
+        .update(realTimeMetrics)
+        .eq('session_id', sessionId)
+        .catch(() => {}); // Ignore errors
     }
 
     // Get the metrics
