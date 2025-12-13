@@ -276,7 +276,8 @@ async function restoreActiveSessions() {
         if (restored) {
           console.log(`✅ Session data restored for ${session.session_id}`);
         } else {
-          console.log(`⚠️ No session data found in storage for ${session.session_id}, will try fresh authentication`);
+          console.log(`⚠️ No session data found in storage for ${session.session_id}`);
+          console.log(`   This is expected for new sessions or first deployment. Will attempt to restore client - if session data is invalid, a QR code will be generated.`);
         }
         
         // Then restore the client
@@ -340,6 +341,24 @@ async function restoreClient(userId, sessionId) {
     const client = new Client({
       authStrategy: new LocalAuth({ clientId: sessionId }),
       puppeteer: puppeteerOptions,
+    });
+
+    // Set up QR code handler BEFORE initialize (in case session data is missing)
+    client.on('qr', async (qr) => {
+      console.log(`📱 QR code generated for restored session ${sessionId} - session data may be invalid or expired`);
+      try {
+        const qrCodeData = await qrcode.toDataURL(qr);
+        await supabase
+          .from('whatsapp_sessions')
+          .update({ 
+            status: 'qr_pending',
+            qr_code: qrCodeData 
+          })
+          .eq('session_id', sessionId);
+        console.log(`✅ QR code saved to database for session ${sessionId}`);
+      } catch (error) {
+        console.error(`❌ Error saving QR code for session ${sessionId}:`, error);
+      }
     });
 
     // Set up event handlers
@@ -456,16 +475,36 @@ async function restoreClient(userId, sessionId) {
       clients.set(sessionId, client);
       console.log(`✅ Client restored and stored for session ${sessionId} (waiting for ready...)`);
       
-      // Set timeout to 60 seconds (increased from 30)
+      // Set timeout to 120 seconds (2 minutes) for restoration
       timeoutId = setTimeout(() => {
         if (!isResolved && !client.info) {
-          console.warn(`⚠️ Client for session ${sessionId} did not become ready within 60 seconds - will continue waiting asynchronously`);
-          // Don't resolve - let client become ready in background
-          // The client is already stored in the map, so it will work when ready
-          isResolved = true;
-          resolve(client); // Resolve to avoid hanging promise, but client isn't ready yet
+          console.warn(`⚠️ Client for session ${sessionId} did not become ready within 120 seconds`);
+          
+          // Check if a QR code was generated (meaning re-auth is needed)
+          // If not, there might be another issue - mark as failed
+          supabase
+            .from('whatsapp_sessions')
+            .select('status, qr_code')
+            .eq('session_id', sessionId)
+            .single()
+            .then(({ data: sessionData }) => {
+              if (sessionData && sessionData.status !== 'qr_pending') {
+                // No QR code generated and not ready - mark as failed
+                supabase
+                  .from('whatsapp_sessions')
+                  .update({ status: 'failed' })
+                  .eq('session_id', sessionId);
+                console.log(`❌ Session ${sessionId} marked as failed - no authentication progress`);
+              }
+            });
+          
+          // Resolve the promise so restore doesn't hang, but client is stored
+          if (!isResolved) {
+            isResolved = true;
+            resolve(client);
+          }
         }
-      }, 60000); // Increased to 60 seconds
+      }, 120000); // 120 seconds
     }).catch((error) => {
       clearTimeout(timeoutId);
       if (isResolved) return;
@@ -473,6 +512,14 @@ async function restoreClient(userId, sessionId) {
       
       console.error(`❌ Error initializing restored client for session ${sessionId}:`, error);
       clients.delete(sessionId);
+      
+      // Mark session as failed if initialization fails
+      supabase
+        .from('whatsapp_sessions')
+        .update({ status: 'failed' })
+        .eq('session_id', sessionId)
+        .catch(err => console.error('Error updating session status:', err));
+      
       reject(error);
     });
   });
@@ -1453,13 +1500,86 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'recipient and otp are required' });
     }
 
-    const client = clients.get(req.sessionId);
+    let client = clients.get(req.sessionId);
     if (!client) {
-      return res.status(404).json({ error: 'WhatsApp session not found. Please reconnect via the dashboard.' });
+      // Check if session exists in database and try to restore it
+      const { data: sessionData } = await supabase
+        .from('whatsapp_sessions')
+        .select('status, updated_at, created_at')
+        .eq('session_id', req.sessionId)
+        .eq('user_id', req.userId)
+        .single();
+
+      if (sessionData) {
+        // Check if session has been stuck for >5 minutes
+        const lastUpdate = new Date(sessionData.updated_at || sessionData.created_at);
+        const minutesSinceUpdate = (Date.now() - lastUpdate.getTime()) / 1000 / 60;
+        
+        if (minutesSinceUpdate > 5 && (sessionData.status === 'connected' || sessionData.status === 'connecting')) {
+          // Session stuck, mark as disconnected
+          await supabase
+            .from('whatsapp_sessions')
+            .update({ status: 'disconnected' })
+            .eq('session_id', req.sessionId);
+          return res.status(400).json({ 
+            error: 'WhatsApp session timed out. Please reconnect your account via the dashboard.',
+            sessionStatus: 'failed'
+          });
+        }
+        
+        if (sessionData.status === 'connected' || sessionData.status === 'connecting') {
+          // Try to restore session on demand
+          console.log(`🔄 Attempting on-demand restoration for session ${req.sessionId}`);
+          try {
+            await restoreSession(req.sessionId);
+            client = await restoreClient(req.userId, req.sessionId);
+            // Wait a bit for client to potentially become ready
+            await new Promise(resolve => setTimeout(resolve, 3000));
+          } catch (restoreError) {
+            console.error(`❌ Failed to restore session ${req.sessionId}:`, restoreError.message);
+            return res.status(503).json({ 
+              error: 'Failed to restore WhatsApp session. Please reconnect your account via the dashboard.',
+              sessionStatus: 'failed'
+            });
+          }
+        } else {
+          return res.status(400).json({ 
+            error: `WhatsApp session is ${sessionData.status}. Please reconnect via the dashboard.`,
+            sessionStatus: sessionData.status
+          });
+        }
+      } else {
+        return res.status(404).json({ error: 'WhatsApp session not found. Please reconnect via the dashboard.' });
+      }
     }
 
     if (!isClientReady(client)) {
       if (client && !client.info) {
+        // Check how long it's been initializing
+        const { data: sessionData } = await supabase
+          .from('whatsapp_sessions')
+          .select('updated_at, created_at, status')
+          .eq('session_id', req.sessionId)
+          .single();
+        
+        if (sessionData) {
+          const lastUpdate = new Date(sessionData.updated_at || sessionData.created_at);
+          const minutesSinceUpdate = (Date.now() - lastUpdate.getTime()) / 1000 / 60;
+          
+          if (minutesSinceUpdate > 5) {
+            // Been stuck for >5 minutes
+            clients.delete(req.sessionId);
+            await supabase
+              .from('whatsapp_sessions')
+              .update({ status: 'disconnected' })
+              .eq('session_id', req.sessionId);
+            return res.status(400).json({ 
+              error: 'WhatsApp session initialization timed out. Please reconnect your account via the dashboard.',
+              sessionStatus: 'failed'
+            });
+          }
+        }
+        
         return res.status(503).json({ 
           error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
           sessionStatus: 'initializing'
