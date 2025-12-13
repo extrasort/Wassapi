@@ -902,22 +902,84 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
     
     // Format phone number (remove any non-digits except +, then remove +)
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
-    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
     
-    console.log(`📱 Sending OTP to ${chatId}`);
+    // Validate phone number format (should be digits only, 9-15 digits)
+    if (!/^\d{9,15}$/.test(formattedNumber)) {
+      // Refund balance
+      if (balanceCheck.success) {
+        const { data: userProfile } = await supabase
+          .from('user_profiles')
+          .select('wallet_balance')
+          .eq('id', userId)
+          .single();
+        if (userProfile) {
+          const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+          await supabase
+            .from('user_profiles')
+            .update({ wallet_balance: refundedBalance })
+            .eq('id', userId);
+        }
+      }
+      return res.status(400).json({ 
+        error: 'Invalid phone number format. Please use international format without + (e.g., 9647812345678)',
+        received: recipient
+      });
+    }
+    
+    console.log(`📱 Sending OTP to ${formattedNumber}`);
     
     try {
-      // Try to get the number ID first (resolves LID issue)
+      // Try to get the number ID (LID) first - required for sending messages
       let numberId;
       try {
-        numberId = await client.getNumberId(chatId.replace('@c.us', ''));
-        if (numberId) {
-          chatId = numberId._serialized;
-          console.log(`✅ Resolved number ID for ${formattedNumber}: ${chatId}`);
+        numberId = await client.getNumberId(formattedNumber);
+        if (!numberId || !numberId._serialized) {
+          // Refund balance
+          if (balanceCheck.success) {
+            const { data: userProfile } = await supabase
+              .from('user_profiles')
+              .select('wallet_balance')
+              .eq('id', userId)
+              .single();
+            if (userProfile) {
+              const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+              await supabase
+                .from('user_profiles')
+                .update({ wallet_balance: refundedBalance })
+                .eq('id', userId);
+            }
+          }
+          return res.status(400).json({ 
+            error: `Unable to resolve WhatsApp account for number ${formattedNumber}. The number may not be registered on WhatsApp or may be invalid.`,
+            recipient: formattedNumber,
+            hint: 'Ensure the phone number is registered on WhatsApp and uses the correct international format without +'
+          });
         }
+        var chatId = numberId._serialized;
+        console.log(`✅ Resolved LID for ${formattedNumber}: ${chatId}`);
       } catch (lidError) {
-        console.log(`⚠️ Could not resolve number ID for ${chatId}, trying direct send...`);
-        // Continue with original chatId if resolution fails
+        console.error(`❌ Error resolving LID for ${formattedNumber}:`, lidError.message);
+        // Refund balance
+        if (balanceCheck.success) {
+          const { data: userProfile } = await supabase
+            .from('user_profiles')
+            .select('wallet_balance')
+            .eq('id', userId)
+            .single();
+          if (userProfile) {
+            const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+            await supabase
+              .from('user_profiles')
+              .update({ wallet_balance: refundedBalance })
+              .eq('id', userId);
+          }
+        }
+        return res.status(400).json({ 
+          error: `Unable to resolve WhatsApp account for number ${formattedNumber}. The number may not be registered on WhatsApp.`,
+          recipient: formattedNumber,
+          details: lidError.message,
+          hint: 'Ensure the phone number is registered on WhatsApp and uses the correct international format without + (e.g., 9647812345678)'
+        });
       }
       
     await client.sendMessage(chatId, message);
@@ -1113,16 +1175,40 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
 
         // Format phone number
         const formattedRecipient = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
-        let chatId = `${formattedRecipient}@c.us`;
         
-        // Try to resolve number ID first
+        // Validate phone number format
+        if (!/^\d{9,15}$/.test(formattedRecipient)) {
+          console.error(`⚠️ Invalid phone number format: ${recipient}`);
+          errors.push({ 
+            recipient, 
+            error: 'Invalid phone number format. Use international format without + (e.g., 9647812345678)' 
+          });
+          refundAmount += MESSAGE_COST_IQD;
+          continue;
+        }
+        
+        // Try to resolve number ID (LID) - required for sending messages
+        let chatId;
         try {
           const numberId = await client.getNumberId(formattedRecipient);
-          if (numberId) {
-            chatId = numberId._serialized;
+          if (!numberId || !numberId._serialized) {
+            console.error(`⚠️ Could not resolve LID for ${formattedRecipient}`);
+            errors.push({ 
+              recipient, 
+              error: `Unable to resolve WhatsApp account. The number may not be registered on WhatsApp.` 
+            });
+            refundAmount += MESSAGE_COST_IQD;
+            continue;
           }
+          chatId = numberId._serialized;
         } catch (lidError) {
-          // Continue with original chatId
+          console.error(`❌ Error resolving LID for ${formattedRecipient}:`, lidError.message);
+          errors.push({ 
+            recipient, 
+            error: `Unable to resolve WhatsApp account: ${lidError.message}` 
+          });
+          refundAmount += MESSAGE_COST_IQD;
+          continue;
         }
         
         await client.sendMessage(chatId, message);
@@ -1359,18 +1445,37 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
 
     // Format phone number
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
-    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
+    
+    // Validate phone number format (should be digits only, 9-15 digits)
+    if (!/^\d{9,15}$/.test(formattedNumber)) {
+      return res.status(400).json({ 
+        error: 'Invalid phone number format. Please use international format without + (e.g., 9647812345678)',
+        received: recipient
+      });
+    }
 
     try {
-      // Try to resolve number ID
+      // Try to resolve number ID (LID) - required for sending messages
       let numberId;
       try {
         numberId = await client.getNumberId(formattedNumber);
-        if (numberId) {
-          chatId = numberId._serialized;
+        if (!numberId || !numberId._serialized) {
+          return res.status(400).json({ 
+            error: `Unable to resolve WhatsApp account for number ${formattedNumber}. The number may not be registered on WhatsApp or may be invalid.`,
+            recipient: formattedNumber,
+            hint: 'Ensure the phone number is registered on WhatsApp and uses the correct international format without +'
+          });
         }
+        var chatId = numberId._serialized;
+        console.log(`✅ Resolved LID for ${formattedNumber}: ${chatId}`);
       } catch (lidError) {
-        console.log(`⚠️ Could not resolve number ID for ${formattedNumber}, trying direct send...`);
+        console.error(`❌ Error resolving LID for ${formattedNumber}:`, lidError.message);
+        return res.status(400).json({ 
+          error: `Unable to resolve WhatsApp account for number ${formattedNumber}. The number may not be registered on WhatsApp.`,
+          recipient: formattedNumber,
+          details: lidError.message,
+          hint: 'Ensure the phone number is registered on WhatsApp and uses the correct international format without + (e.g., 9647812345678)'
+        });
       }
 
       await client.sendMessage(chatId, message);
@@ -1484,19 +1589,82 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
 
     // Format phone number (remove any non-digits except +, then remove +)
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
-    let chatId = formattedNumber.includes('@') ? formattedNumber : `${formattedNumber}@c.us`;
+    
+    // Validate phone number format (should be digits only, 9-15 digits)
+    if (!/^\d{9,15}$/.test(formattedNumber)) {
+      // Refund balance
+      if (balanceCheck.success) {
+        const { data: userProfile } = await supabase
+          .from('user_profiles')
+          .select('wallet_balance')
+          .eq('id', req.userId)
+          .single();
+        if (userProfile) {
+          const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+          await supabase
+            .from('user_profiles')
+            .update({ wallet_balance: refundedBalance })
+            .eq('id', req.userId);
+        }
+      }
+      return res.status(400).json({ 
+        error: 'Invalid phone number format. Please use international format without + (e.g., 9647812345678)',
+        received: recipient
+      });
+    }
     
     try {
-      // Try to get the number ID first (resolves LID issue)
+      // Try to get the number ID (LID) first - required for sending messages
       let numberId;
       try {
-        numberId = await client.getNumberId(chatId.replace('@c.us', ''));
-        if (numberId) {
-          chatId = numberId._serialized;
+        numberId = await client.getNumberId(formattedNumber);
+        if (!numberId || !numberId._serialized) {
+          // Refund balance
+          if (balanceCheck.success) {
+            const { data: userProfile } = await supabase
+              .from('user_profiles')
+              .select('wallet_balance')
+              .eq('id', req.userId)
+              .single();
+            if (userProfile) {
+              const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+              await supabase
+                .from('user_profiles')
+                .update({ wallet_balance: refundedBalance })
+                .eq('id', req.userId);
+            }
+          }
+          return res.status(400).json({ 
+            error: `Unable to resolve WhatsApp account for number ${formattedNumber}. The number may not be registered on WhatsApp or may be invalid.`,
+            recipient: formattedNumber,
+            hint: 'Ensure the phone number is registered on WhatsApp and uses the correct international format without +'
+          });
         }
+        var chatId = numberId._serialized;
+        console.log(`✅ Resolved LID for ${formattedNumber}: ${chatId}`);
       } catch (lidError) {
-        console.log(`⚠️ Could not resolve number ID for ${chatId}, trying direct send...`);
-        // Continue with original chatId if resolution fails
+        console.error(`❌ Error resolving LID for ${formattedNumber}:`, lidError.message);
+        // Refund balance
+        if (balanceCheck.success) {
+          const { data: userProfile } = await supabase
+            .from('user_profiles')
+            .select('wallet_balance')
+            .eq('id', req.userId)
+            .single();
+          if (userProfile) {
+            const refundedBalance = balanceCheck.balanceAfter + MESSAGE_COST_IQD;
+            await supabase
+              .from('user_profiles')
+              .update({ wallet_balance: refundedBalance })
+              .eq('id', req.userId);
+          }
+        }
+        return res.status(400).json({ 
+          error: `Unable to resolve WhatsApp account for number ${formattedNumber}. The number may not be registered on WhatsApp.`,
+          recipient: formattedNumber,
+          details: lidError.message,
+          hint: 'Ensure the phone number is registered on WhatsApp and uses the correct international format without + (e.g., 9647812345678)'
+        });
       }
       
       const messageResult = await client.sendMessage(chatId, message);
