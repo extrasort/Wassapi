@@ -389,23 +389,6 @@ async function restoreClient(userId, sessionId) {
               })
               .eq('session_id', sessionId);
             
-            // Track subscription usage for restored session (if it's a new number)
-            if (session && session.user_id) {
-              const activeSubscription = await getActiveSubscription(session.user_id);
-              if (activeSubscription) {
-                // Check if this is a new number by counting existing connected sessions
-                const { count } = await supabase
-                  .from('whatsapp_sessions')
-                  .select('*', { count: 'exact', head: true })
-                  .eq('user_id', session.user_id)
-                  .eq('status', 'connected');
-                
-                // Only increment if this is the first connected session (new number)
-                if (count === 1) {
-                  await incrementSubscriptionUsage(activeSubscription.id, 0, 1);
-                }
-              }
-            }
             
             // Backup session data to Supabase Storage
             backupSession(sessionId).catch(err => {
@@ -659,11 +642,6 @@ async function initializeClient(userId, sessionId) {
       } else {
         console.log('✅ Session status updated to connected');
         
-        // Track subscription usage for new number
-        const activeSubscription = await getActiveSubscription(userId);
-        if (activeSubscription) {
-          await incrementSubscriptionUsage(activeSubscription.id, 0, 1);
-        }
       }
       
       // Backup session data to Supabase Storage (async, don't block)
@@ -777,16 +755,6 @@ app.post('/api/whatsapp/connect', async (req, res) => {
       return res.status(400).json({ error: 'userId and sessionId are required' });
     }
 
-    // Check subscription limits for new number
-    const subscriptionCheck = await checkSubscriptionLimits(userId, 0, 1);
-    if (!subscriptionCheck.allowed) {
-      return res.status(403).json({
-        error: 'Subscription limit exceeded',
-        reason: subscriptionCheck.reason,
-        details: subscriptionCheck,
-        message: 'You have reached the maximum number of WhatsApp accounts allowed by your subscription. Please upgrade your subscription to connect more accounts.'
-      });
-    }
 
     // Check if user already has a connected session
     const { data: existingSessions } = await supabase
@@ -1006,16 +974,6 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
     }
 
-    // Check subscription limits
-    const subscriptionCheck = await checkSubscriptionLimits(userId, 1, 0);
-    if (!subscriptionCheck.allowed) {
-      return res.status(403).json({
-        error: 'Subscription limit exceeded',
-        reason: subscriptionCheck.reason,
-        details: subscriptionCheck
-      });
-    }
-
     // Check rate limits
     const rateLimitCheck = await checkRateLimit(userId, 1);
     if (!rateLimitCheck.allowed) {
@@ -1143,11 +1101,6 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       status: 'sent',
     });
 
-      // Track subscription usage
-      if (subscriptionCheck.subscription_id) {
-        await incrementSubscriptionUsage(subscriptionCheck.subscription_id, 1, 0);
-      }
-
       res.json({ 
         success: true,
         balance: balanceCheck.balanceAfter,
@@ -1257,16 +1210,6 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
         .update({ status: 'disconnected' })
         .eq('session_id', sessionId);
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
-    }
-
-    // Check subscription limits
-    const subscriptionCheck = await checkSubscriptionLimits(userId, recipients.length, 0);
-    if (!subscriptionCheck.allowed) {
-      return res.status(403).json({
-        error: 'Subscription limit exceeded',
-        reason: subscriptionCheck.reason,
-        details: subscriptionCheck
-      });
     }
 
     // Check rate limits
@@ -1444,11 +1387,6 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     });
 
     console.log(`✅ Announcement sent: ${sent}/${recipients.length} successful`);
-
-    // Track subscription usage (only for successfully sent messages)
-    if (subscriptionCheck && subscriptionCheck.subscription_id && sent > 0) {
-      await incrementSubscriptionUsage(subscriptionCheck.subscription_id, sent, 0);
-    }
 
     // Trigger webhooks for announcement (async, don't wait)
     triggerWebhooks(userId, sessionId, 'announcement', {
@@ -1702,16 +1640,6 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
     }
 
-    // Check subscription limits
-    const subscriptionCheck = await checkSubscriptionLimits(req.userId, 1, 0);
-    if (!subscriptionCheck.allowed) {
-      return res.status(403).json({
-        error: 'Subscription limit exceeded',
-        reason: subscriptionCheck.reason,
-        details: subscriptionCheck
-      });
-    }
-
     // Check rate limits
     const rateLimitCheck = await checkRateLimit(req.userId, 1);
     if (!rateLimitCheck.allowed) {
@@ -1789,11 +1717,6 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
         message: `OTP: ${otp}`,
         status: 'sent',
       });
-
-      // Track subscription usage
-      if (subscriptionCheck.subscription_id) {
-        await incrementSubscriptionUsage(subscriptionCheck.subscription_id, 1, 0);
-      }
 
       // Trigger webhooks for successful OTP send (async, don't wait)
       triggerWebhooks(req.userId, req.sessionId, 'otp', {
@@ -1880,16 +1803,6 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
         });
       }
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
-    }
-
-    // Check subscription limits
-    const subscriptionCheck = await checkSubscriptionLimits(req.userId, 1, 0);
-    if (!subscriptionCheck.allowed) {
-      return res.status(403).json({
-        error: 'Subscription limit exceeded',
-        reason: subscriptionCheck.reason,
-        details: subscriptionCheck
-      });
     }
 
     // Check rate limits
@@ -1996,11 +1909,6 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
       }
       
       const messageResult = await client.sendMessage(chatId, message);
-
-      // Track subscription usage
-      if (subscriptionCheck.subscription_id) {
-        await incrementSubscriptionUsage(subscriptionCheck.subscription_id, 1, 0);
-      }
 
       // Log to database
       await supabase.from('automation_logs').insert({
@@ -2128,16 +2036,6 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
     }
 
-    // Check subscription limits
-    const subscriptionCheck = await checkSubscriptionLimits(req.userId, recipients.length, 0);
-    if (!subscriptionCheck.allowed) {
-      return res.status(403).json({
-        error: 'Subscription limit exceeded',
-        reason: subscriptionCheck.reason,
-        details: subscriptionCheck
-      });
-    }
-
     // Check rate limits
     const rateLimitCheck = await checkRateLimit(req.userId, recipients.length);
     if (!rateLimitCheck.allowed) {
@@ -2226,11 +2124,6 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
         description: `Refund: Failed to send ${errors.length} messages via API`,
         reference_id: `refund_api_bulk_${Date.now()}`
       });
-    }
-
-    // Track subscription usage (only for successfully sent messages)
-    if (subscriptionCheck && subscriptionCheck.subscription_id && sent > 0) {
-      await incrementSubscriptionUsage(subscriptionCheck.subscription_id, sent, 0);
     }
 
     res.json({
@@ -2575,150 +2468,6 @@ app.get('/api/wallet/topups/:userId', async (req, res) => {
   }
 });
 
-// ==================== SUBSCRIPTION ENDPOINTS ====================
-
-// Get subscription tiers
-app.get('/api/subscriptions/tiers', async (req, res) => {
-  try {
-    const { data: tiers, error } = await supabase
-      .from('subscription_tiers')
-      .select('*')
-      .eq('is_active', true)
-      .order('price_iqd', { ascending: true });
-
-    if (error) {
-      throw error;
-    }
-
-    res.json({ success: true, tiers });
-  } catch (error) {
-    console.error('❌ Error fetching subscription tiers:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Get user's active subscription
-app.get('/api/subscriptions/:userId', async (req, res) => {
-  try {
-    const { userId } = req.params;
-    const { data: subscription, error } = await supabase
-      .from('user_subscriptions')
-      .select(`
-        *,
-        subscription_tiers (*)
-      `)
-      .eq('user_id', userId)
-      .eq('status', 'active')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
-      throw error;
-    }
-
-    res.json({ success: true, subscription: subscription || null });
-  } catch (error) {
-    console.error('❌ Error fetching subscription:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// Create subscription
-app.post('/api/subscriptions', async (req, res) => {
-  try {
-    const { userId, tierKey } = req.body;
-
-    if (!userId || !tierKey) {
-      return res.status(400).json({ error: 'userId and tierKey are required' });
-    }
-
-    // Get tier details
-    const { data: tier, error: tierError } = await supabase
-      .from('subscription_tiers')
-      .select('*')
-      .eq('tier_key', tierKey)
-      .eq('is_active', true)
-      .single();
-
-    if (tierError || !tier) {
-      return res.status(404).json({ error: 'Subscription tier not found' });
-    }
-
-    // Check wallet balance
-    const { data: userProfile, error: profileError } = await supabase
-      .from('user_profiles')
-      .select('wallet_balance')
-      .eq('id', userId)
-      .single();
-
-    if (profileError) {
-      throw profileError;
-    }
-
-    const currentBalance = userProfile?.wallet_balance || 0;
-    if (currentBalance < tier.price_iqd) {
-      return res.status(400).json({ 
-        error: 'Insufficient balance',
-        required: tier.price_iqd,
-        current: currentBalance
-      });
-    }
-
-    // Deduct from wallet
-    const newBalance = currentBalance - tier.price_iqd;
-    const { error: balanceError } = await supabase
-      .from('user_profiles')
-      .update({ wallet_balance: newBalance })
-      .eq('id', userId);
-
-    if (balanceError) {
-      throw balanceError;
-    }
-
-    // Create wallet transaction
-    await supabase.from('wallet_transactions').insert({
-      user_id: userId,
-      transaction_type: 'debit',
-      amount: tier.price_iqd,
-      balance_before: currentBalance,
-      balance_after: newBalance,
-      description: `Subscription: ${tier.tier_name}`,
-      reference_id: `subscription_${Date.now()}`
-    });
-
-    // Calculate expiration (premium never expires, others are 30 days)
-    const expiresAt = tier.messages_limit === null ? null : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
-
-    // Create subscription
-    const { data: subscription, error: subError } = await supabase
-      .from('user_subscriptions')
-      .insert({
-        user_id: userId,
-        tier_key: tierKey,
-        status: 'active',
-        expires_at: expiresAt,
-        messages_used: 0,
-        numbers_used: 0
-      })
-      .select()
-      .single();
-
-    if (subError) {
-      throw subError;
-    }
-
-    res.json({
-      success: true,
-      subscription,
-      newBalance
-    });
-  } catch (error) {
-    console.error('❌ Error creating subscription:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
 // ==================== SETTINGS ENDPOINTS ====================
 
 // Get user settings
@@ -2841,43 +2590,7 @@ app.post('/api/users/profile/:userId', async (req, res) => {
   }
 });
 
-// ==================== SUBSCRIPTION & RATE LIMITING HELPERS ====================
-
-// Check subscription limits
-async function checkSubscriptionLimits(userId, messagesNeeded = 1, numbersNeeded = 0) {
-  try {
-    const { data, error } = await supabase.rpc('check_subscription_limits', {
-      p_user_id: userId,
-      p_messages_needed: messagesNeeded,
-      p_numbers_needed: numbersNeeded
-    });
-
-    if (error) {
-      console.error('Error checking subscription limits:', error);
-      // If function doesn't exist or error, allow (fallback)
-      return { allowed: true };
-    }
-
-    return data || { allowed: true };
-  } catch (error) {
-    console.error('Error in checkSubscriptionLimits:', error);
-    return { allowed: true }; // Fallback: allow if check fails
-  }
-}
-
-// Increment subscription usage
-async function incrementSubscriptionUsage(subscriptionId, messages = 1, numbers = 0) {
-  try {
-    await supabase.rpc('increment_subscription_usage', {
-      p_subscription_id: subscriptionId,
-      p_messages: messages,
-      p_numbers: numbers
-    });
-  } catch (error) {
-    console.error('Error incrementing subscription usage:', error);
-    // Non-blocking error
-  }
-}
+// ==================== RATE LIMITING HELPERS ====================
 
 // Check rate limits
 async function checkRateLimit(userId, messageCount = 1) {
@@ -2958,28 +2671,6 @@ async function checkRateLimit(userId, messageCount = 1) {
   }
 }
 
-// Get active subscription for user
-async function getActiveSubscription(userId) {
-  try {
-    const { data, error } = await supabase
-      .from('user_subscriptions')
-      .select('id, tier_key, messages_used, numbers_used')
-      .eq('user_id', userId)
-      .eq('status', 'active')
-      .order('created_at', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (error && error.code !== 'PGRST116') {
-      console.error('Error fetching subscription:', error);
-    }
-
-    return data || null;
-  } catch (error) {
-    console.error('Error in getActiveSubscription:', error);
-    return null;
-  }
-}
 
 // ==================== WEBHOOK HELPERS ====================
 
