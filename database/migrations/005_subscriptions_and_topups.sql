@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS subscription_tiers (
     tier_key VARCHAR(50) UNIQUE NOT NULL, -- 'basic', 'standard', 'premium'
     price_iqd INTEGER NOT NULL,
     messages_limit INTEGER, -- NULL means unlimited
-    numbers_limit INTEGER NOT NULL, -- NULL means unlimited
+    numbers_limit INTEGER, -- NULL means unlimited
     description TEXT,
     features JSONB,
     is_active BOOLEAN DEFAULT true,
@@ -16,11 +16,18 @@ CREATE TABLE IF NOT EXISTS subscription_tiers (
 );
 
 -- Insert subscription tiers
+-- Note: For premium tier, NULL in messages_limit and numbers_limit means unlimited
 INSERT INTO subscription_tiers (tier_name, tier_key, price_iqd, messages_limit, numbers_limit, description, features) VALUES
 ('Basic', 'basic', 10000, 1200, 1, 'Perfect for small businesses - 1200 messages for 1 number', '{"messages": 1200, "numbers": 1, "support": "email"}'),
 ('Standard', 'standard', 25000, 3000, 3, 'Ideal for growing businesses - 3000 messages for 3 numbers', '{"messages": 3000, "numbers": 3, "support": "priority"}'),
 ('Premium', 'premium', 100000, NULL, NULL, 'Unlimited messages and numbers for enterprise needs', '{"messages": "unlimited", "numbers": "unlimited", "support": "24/7"}')
-ON CONFLICT (tier_key) DO NOTHING;
+ON CONFLICT (tier_key) DO UPDATE SET
+  price_iqd = EXCLUDED.price_iqd,
+  messages_limit = EXCLUDED.messages_limit,
+  numbers_limit = EXCLUDED.numbers_limit,
+  description = EXCLUDED.description,
+  features = EXCLUDED.features,
+  is_active = EXCLUDED.is_active;
 
 -- User Subscriptions Table
 CREATE TABLE IF NOT EXISTS user_subscriptions (
