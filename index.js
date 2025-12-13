@@ -2474,6 +2474,8 @@ app.get('/api/wallet/topups/:userId', async (req, res) => {
 app.get('/api/settings/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
+    console.log(`📖 Fetching settings for user ${userId}`);
+    
     const { data: settings, error } = await supabase
       .from('user_settings')
       .select('*')
@@ -2481,32 +2483,36 @@ app.get('/api/settings/:userId', async (req, res) => {
       .single();
 
     if (error && error.code !== 'PGRST116') {
+      console.error('❌ Error fetching settings:', error);
       throw error;
     }
 
     // Return default settings if none exist
     if (!settings) {
+      console.log(`✨ No settings found for user ${userId}, returning defaults`);
+      const defaultSettings = {
+        rate_limit_per_minute: 10,
+        rate_limit_per_hour: 100,
+        rate_limit_per_day: 1000,
+        auto_retry_failed_messages: true,
+        max_retry_attempts: 3,
+        webhook_timeout_seconds: 30,
+        enable_message_logging: true,
+        notification_preferences: { email: true, webhook: true },
+        custom_settings: {}
+      };
       res.json({
         success: true,
-        settings: {
-          rate_limit_per_minute: 10,
-          rate_limit_per_hour: 100,
-          rate_limit_per_day: 1000,
-          auto_retry_failed_messages: true,
-          max_retry_attempts: 3,
-          webhook_timeout_seconds: 30,
-          enable_message_logging: true,
-          notification_preferences: { email: true, webhook: true },
-          custom_settings: {}
-        }
+        settings: defaultSettings
       });
       return;
     }
 
+    console.log(`✅ Settings found for user ${userId}`);
     res.json({ success: true, settings });
   } catch (error) {
     console.error('❌ Error fetching settings:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Failed to fetch settings' });
   }
 });
 
@@ -2515,6 +2521,8 @@ app.put('/api/settings/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
     const updates = req.body;
+
+    console.log(`📝 Updating settings for user ${userId}:`, updates);
 
     // Check if settings exist
     const { data: existing, error: checkError } = await supabase
@@ -2526,32 +2534,40 @@ app.put('/api/settings/:userId', async (req, res) => {
     let result;
     if (checkError && checkError.code === 'PGRST116') {
       // Create new settings
+      console.log(`✨ Creating new settings for user ${userId}`);
       result = await supabase
         .from('user_settings')
         .insert({
           user_id: userId,
-          ...updates
+          ...updates,
+          updated_at: new Date().toISOString()
         })
         .select()
         .single();
     } else {
       // Update existing settings
+      console.log(`🔄 Updating existing settings for user ${userId}`);
       result = await supabase
         .from('user_settings')
-        .update(updates)
+        .update({
+          ...updates,
+          updated_at: new Date().toISOString()
+        })
         .eq('user_id', userId)
         .select()
         .single();
     }
 
     if (result.error) {
+      console.error('❌ Database error:', result.error);
       throw result.error;
     }
 
+    console.log(`✅ Settings updated successfully for user ${userId}`);
     res.json({ success: true, settings: result.data });
   } catch (error) {
     console.error('❌ Error updating settings:', error);
-    res.status(500).json({ error: error.message });
+    res.status(500).json({ error: error.message || 'Failed to update settings' });
   }
 });
 
