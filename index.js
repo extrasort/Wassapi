@@ -1560,38 +1560,58 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
       }
     }
 
-    if (!isClientReady(client)) {
-      if (client && !client.info) {
-        // Check how long it's been initializing
-        const { data: sessionData } = await supabase
-          .from('whatsapp_sessions')
-          .select('updated_at, created_at, status')
-          .eq('session_id', req.sessionId)
-          .single();
+    // Wait for client to become ready if it exists but isn't ready yet
+    if (client && !isClientReady(client)) {
+      console.log(`⏳ Waiting for session ${req.sessionId} to become ready...`);
+      
+      // Check how long it's been initializing
+      const { data: sessionData } = await supabase
+        .from('whatsapp_sessions')
+        .select('updated_at, created_at, status')
+        .eq('session_id', req.sessionId)
+        .single();
+      
+      if (sessionData) {
+        const lastUpdate = new Date(sessionData.updated_at || sessionData.created_at);
+        const minutesSinceUpdate = (Date.now() - lastUpdate.getTime()) / 1000 / 60;
         
-        if (sessionData) {
-          const lastUpdate = new Date(sessionData.updated_at || sessionData.created_at);
-          const minutesSinceUpdate = (Date.now() - lastUpdate.getTime()) / 1000 / 60;
-          
-          if (minutesSinceUpdate > 5) {
-            // Been stuck for >5 minutes
-            clients.delete(req.sessionId);
-            await supabase
-              .from('whatsapp_sessions')
-              .update({ status: 'disconnected' })
-              .eq('session_id', req.sessionId);
-            return res.status(400).json({ 
-              error: 'WhatsApp session initialization timed out. Please reconnect your account via the dashboard.',
-              sessionStatus: 'failed'
-            });
-          }
+        if (minutesSinceUpdate > 5) {
+          // Been stuck for >5 minutes
+          console.log(`⚠️ Session ${req.sessionId} has been initializing for ${minutesSinceUpdate.toFixed(1)} minutes - marking as disconnected`);
+          clients.delete(req.sessionId);
+          await supabase
+            .from('whatsapp_sessions')
+            .update({ status: 'disconnected' })
+            .eq('session_id', req.sessionId);
+          return res.status(400).json({ 
+            error: 'WhatsApp session initialization timed out. Please reconnect your account via the dashboard.',
+            sessionStatus: 'failed'
+          });
         }
-        
+      }
+      
+      // Poll for readiness for up to 15 seconds
+      const maxWaitTime = 15000; // 15 seconds
+      const pollInterval = 500; // Check every 500ms
+      const startTime = Date.now();
+      
+      while (Date.now() - startTime < maxWaitTime) {
+        if (isClientReady(client)) {
+          console.log(`✅ Session ${req.sessionId} became ready after ${Date.now() - startTime}ms`);
+          break;
+        }
+        await new Promise(resolve => setTimeout(resolve, pollInterval));
+      }
+      
+      // Check one more time after polling
+      if (!isClientReady(client)) {
         return res.status(503).json({ 
           error: 'WhatsApp session is still initializing. Please wait a moment and try again.',
-          sessionStatus: 'initializing'
+          sessionStatus: 'initializing',
+          hint: 'The session may need a few more seconds. Please try again in 10-15 seconds.'
         });
       }
+    } else if (!client) {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
     }
 
