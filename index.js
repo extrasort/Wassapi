@@ -897,8 +897,8 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       });
     }
 
-    // Fixed OTP message format
-    const message = `رمز التحقق الخاص بك هو: ${otp}\n\nهذا الرمز صالح لمدة 10 دقائق. لا تشارك هذا الرمز مع أي شخص.\n\nYour verification code is: ${otp}\n\nThis code is valid for 10 minutes. Do not share this code with anyone.`;
+    // Concise OTP message format (short to avoid bans)
+    const message = `${otp}`;
     
     // Format phone number (remove any non-digits except +, then remove +)
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
@@ -1354,8 +1354,8 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
       });
     }
 
-    // Fixed OTP message format (bilingual)
-    const message = `رمز التحقق الخاص بك هو: ${otp}\n\nهذا الرمز صالح لمدة 10 دقائق. لا تشارك هذا الرمز مع أي شخص.\n\nYour verification code is: ${otp}\n\nThis code is valid for 10 minutes. Do not share this code with anyone.`;
+    // Concise OTP message format (short to avoid bans)
+    const message = `${otp}`;
 
     // Format phone number
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
