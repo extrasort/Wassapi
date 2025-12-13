@@ -8,6 +8,7 @@ const { URL } = require('url');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const qrcode = require('qrcode');
 const { createClient } = require('@supabase/supabase-js');
+const { backupSession, restoreSession, deleteSession, ensureBucketExists } = require('./services/session-storage');
 require('dotenv').config();
 
 const app = express();
@@ -245,6 +246,10 @@ app.get('/api/test', (req, res) => {
 async function restoreActiveSessions() {
   try {
     console.log('🔄 Restoring active WhatsApp sessions...');
+    
+    // Ensure storage bucket exists
+    await ensureBucketExists();
+    
     const { data: activeSessions, error } = await supabase
       .from('whatsapp_sessions')
       .select('*')
@@ -265,6 +270,16 @@ async function restoreActiveSessions() {
     // Restore each active session (don't await - let them initialize in parallel)
     const restorePromises = activeSessions.map(async (session) => {
       try {
+        // First, restore session data from Supabase Storage
+        console.log(`📥 Restoring session data for ${session.session_id} from storage...`);
+        const restored = await restoreSession(session.session_id);
+        if (restored) {
+          console.log(`✅ Session data restored for ${session.session_id}`);
+        } else {
+          console.log(`⚠️ No session data found in storage for ${session.session_id}, will try fresh authentication`);
+        }
+        
+        // Then restore the client
         // Don't await - let it initialize in background
         restoreClient(session.user_id, session.session_id).catch((error) => {
           console.error(`❌ Failed to restore session ${session.session_id}:`, error.message);
@@ -349,6 +364,11 @@ async function restoreClient(userId, sessionId) {
               })
               .eq('session_id', sessionId);
             
+            // Backup session data to Supabase Storage
+            backupSession(sessionId).catch(err => {
+              console.error(`⚠️ Failed to backup session ${sessionId}:`, err.message);
+            });
+            
             // Log connection event
             const { data: session } = await supabase
               .from('whatsapp_sessions')
@@ -379,8 +399,12 @@ async function restoreClient(userId, sessionId) {
             resolve(client);
           });
 
-    client.on('authenticated', () => {
+    client.on('authenticated', async () => {
       console.log(`✅ Authenticated for restored session ${sessionId}`);
+      // Backup session data when authenticated (async, don't block)
+      backupSession(sessionId).catch(err => {
+        console.error(`⚠️ Failed to backup session ${sessionId} after authentication:`, err.message);
+      });
     });
 
     client.on('auth_failure', async (msg) => {
@@ -570,6 +594,11 @@ async function initializeClient(userId, sessionId) {
       } else {
         console.log('✅ Session status updated to connected');
       }
+      
+      // Backup session data to Supabase Storage (async, don't block)
+      backupSession(sessionId).catch(err => {
+        console.error(`⚠️ Failed to backup session ${sessionId}:`, err.message);
+      });
 
       // Disconnect any other sessions for this user
       const { error: disconnectError } = await supabase
@@ -622,8 +651,12 @@ async function initializeClient(userId, sessionId) {
       setupIncomingMessageHandlers(client, userId, sessionId);
     });
 
-    client.on('authenticated', () => {
+    client.on('authenticated', async () => {
       console.log(`✅ Authenticated for session ${sessionId}`);
+      // Backup session data when authenticated (async, don't block)
+      backupSession(sessionId).catch(err => {
+        console.error(`⚠️ Failed to backup session ${sessionId} after authentication:`, err.message);
+      });
     });
 
     client.on('auth_failure', async (msg) => {
@@ -742,6 +775,11 @@ app.post('/api/whatsapp/disconnect/:sessionId', async (req, res) => {
       clients.delete(sessionId);
       console.log('✅ Client logged out and removed');
     }
+    
+    // Delete session data from Supabase Storage
+    deleteSession(sessionId).catch(err => {
+      console.error(`⚠️ Failed to delete session ${sessionId} from storage:`, err.message);
+    });
 
     const { error } = await supabase
       .from('whatsapp_sessions')
