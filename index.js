@@ -2246,6 +2246,434 @@ app.post('/api/api-keys/revoke/:userId/:sessionId', async (req, res) => {
   }
 });
 
+// ==================== WALLET TOPUP ENDPOINTS ====================
+
+// Create wallet topup request
+app.post('/api/wallet/topup', async (req, res) => {
+  try {
+    const { userId, amount, paymentMethod, paymentReference } = req.body;
+
+    if (!userId || !amount) {
+      return res.status(400).json({ error: 'userId and amount are required' });
+    }
+
+    if (amount < 1000) {
+      return res.status(400).json({ error: 'Minimum topup amount is 1,000 IQD' });
+    }
+
+    // Calculate bonus using the database function
+    const { data: bonusResult, error: bonusError } = await supabase
+      .rpc('calculate_topup_bonus', { amount });
+
+    if (bonusError) {
+      throw bonusError;
+    }
+
+    const bonusAmount = bonusResult || 0;
+    const totalCredited = amount + bonusAmount;
+
+    // Create topup record
+    const { data: topup, error: topupError } = await supabase
+      .from('wallet_topups')
+      .insert({
+        user_id: userId,
+        amount_iqd: amount,
+        bonus_amount_iqd: bonusAmount,
+        total_credited_iqd: totalCredited,
+        payment_method: paymentMethod || 'manual',
+        payment_reference: paymentReference,
+        status: 'pending'
+      })
+      .select()
+      .single();
+
+    if (topupError) {
+      throw topupError;
+    }
+
+    res.json({
+      success: true,
+      topup: {
+        id: topup.id,
+        amount: amount,
+        bonus: bonusAmount,
+        total: totalCredited,
+        status: topup.status
+      }
+    });
+  } catch (error) {
+    console.error('❌ Error creating topup:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Complete wallet topup (admin/confirmation endpoint)
+app.post('/api/wallet/topup/:topupId/complete', async (req, res) => {
+  try {
+    const { topupId } = req.params;
+
+    // Get topup
+    const { data: topup, error: topupError } = await supabase
+      .from('wallet_topups')
+      .select('*')
+      .eq('id', topupId)
+      .single();
+
+    if (topupError || !topup) {
+      return res.status(404).json({ error: 'Topup not found' });
+    }
+
+    if (topup.status !== 'pending') {
+      return res.status(400).json({ error: `Topup is already ${topup.status}` });
+    }
+
+    // Get current balance
+    const { data: userProfile, error: profileError } = await supabase
+      .from('user_profiles')
+      .select('wallet_balance')
+      .eq('id', topup.user_id)
+      .single();
+
+    if (profileError) {
+      throw profileError;
+    }
+
+    const currentBalance = userProfile?.wallet_balance || 0;
+    const newBalance = currentBalance + topup.total_credited_iqd;
+
+    // Update wallet balance
+    const { error: balanceError } = await supabase
+      .from('user_profiles')
+      .update({ wallet_balance: newBalance })
+      .eq('id', topup.user_id);
+
+    if (balanceError) {
+      throw balanceError;
+    }
+
+    // Create wallet transaction
+    await supabase.from('wallet_transactions').insert({
+      user_id: topup.user_id,
+      transaction_type: 'credit',
+      amount: topup.total_credited_iqd,
+      balance_before: currentBalance,
+      balance_after: newBalance,
+      description: `Topup: ${topup.amount_iqd} IQD + ${topup.bonus_amount_iqd} IQD bonus`,
+      reference_id: `topup_${topup.id}`
+    });
+
+    // Update topup status
+    const { error: updateError } = await supabase
+      .from('wallet_topups')
+      .update({
+        status: 'completed',
+        processed_at: new Date().toISOString()
+      })
+      .eq('id', topupId);
+
+    if (updateError) {
+      throw updateError;
+    }
+
+    res.json({
+      success: true,
+      balance: newBalance,
+      credited: topup.total_credited_iqd
+    });
+  } catch (error) {
+    console.error('❌ Error completing topup:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get topup history
+app.get('/api/wallet/topups/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: topups, error } = await supabase
+      .from('wallet_topups')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, topups });
+  } catch (error) {
+    console.error('❌ Error fetching topups:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== SUBSCRIPTION ENDPOINTS ====================
+
+// Get subscription tiers
+app.get('/api/subscriptions/tiers', async (req, res) => {
+  try {
+    const { data: tiers, error } = await supabase
+      .from('subscription_tiers')
+      .select('*')
+      .eq('is_active', true)
+      .order('price_iqd', { ascending: true });
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, tiers });
+  } catch (error) {
+    console.error('❌ Error fetching subscription tiers:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get user's active subscription
+app.get('/api/subscriptions/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: subscription, error } = await supabase
+      .from('user_subscriptions')
+      .select(`
+        *,
+        subscription_tiers (*)
+      `)
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
+      throw error;
+    }
+
+    res.json({ success: true, subscription: subscription || null });
+  } catch (error) {
+    console.error('❌ Error fetching subscription:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Create subscription
+app.post('/api/subscriptions', async (req, res) => {
+  try {
+    const { userId, tierKey } = req.body;
+
+    if (!userId || !tierKey) {
+      return res.status(400).json({ error: 'userId and tierKey are required' });
+    }
+
+    // Get tier details
+    const { data: tier, error: tierError } = await supabase
+      .from('subscription_tiers')
+      .select('*')
+      .eq('tier_key', tierKey)
+      .eq('is_active', true)
+      .single();
+
+    if (tierError || !tier) {
+      return res.status(404).json({ error: 'Subscription tier not found' });
+    }
+
+    // Check wallet balance
+    const { data: userProfile, error: profileError } = await supabase
+      .from('user_profiles')
+      .select('wallet_balance')
+      .eq('id', userId)
+      .single();
+
+    if (profileError) {
+      throw profileError;
+    }
+
+    const currentBalance = userProfile?.wallet_balance || 0;
+    if (currentBalance < tier.price_iqd) {
+      return res.status(400).json({ 
+        error: 'Insufficient balance',
+        required: tier.price_iqd,
+        current: currentBalance
+      });
+    }
+
+    // Deduct from wallet
+    const newBalance = currentBalance - tier.price_iqd;
+    const { error: balanceError } = await supabase
+      .from('user_profiles')
+      .update({ wallet_balance: newBalance })
+      .eq('id', userId);
+
+    if (balanceError) {
+      throw balanceError;
+    }
+
+    // Create wallet transaction
+    await supabase.from('wallet_transactions').insert({
+      user_id: userId,
+      transaction_type: 'debit',
+      amount: tier.price_iqd,
+      balance_before: currentBalance,
+      balance_after: newBalance,
+      description: `Subscription: ${tier.tier_name}`,
+      reference_id: `subscription_${Date.now()}`
+    });
+
+    // Calculate expiration (premium never expires, others are 30 days)
+    const expiresAt = tier.messages_limit === null ? null : new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+
+    // Create subscription
+    const { data: subscription, error: subError } = await supabase
+      .from('user_subscriptions')
+      .insert({
+        user_id: userId,
+        tier_key: tierKey,
+        status: 'active',
+        expires_at: expiresAt,
+        messages_used: 0,
+        numbers_used: 0
+      })
+      .select()
+      .single();
+
+    if (subError) {
+      throw subError;
+    }
+
+    res.json({
+      success: true,
+      subscription,
+      newBalance
+    });
+  } catch (error) {
+    console.error('❌ Error creating subscription:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ==================== SETTINGS ENDPOINTS ====================
+
+// Get user settings
+app.get('/api/settings/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { data: settings, error } = await supabase
+      .from('user_settings')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      throw error;
+    }
+
+    // Return default settings if none exist
+    if (!settings) {
+      res.json({
+        success: true,
+        settings: {
+          rate_limit_per_minute: 10,
+          rate_limit_per_hour: 100,
+          rate_limit_per_day: 1000,
+          auto_retry_failed_messages: true,
+          max_retry_attempts: 3,
+          webhook_timeout_seconds: 30,
+          enable_message_logging: true,
+          notification_preferences: { email: true, webhook: true },
+          custom_settings: {}
+        }
+      });
+      return;
+    }
+
+    res.json({ success: true, settings });
+  } catch (error) {
+    console.error('❌ Error fetching settings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update user settings
+app.put('/api/settings/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const updates = req.body;
+
+    // Check if settings exist
+    const { data: existing, error: checkError } = await supabase
+      .from('user_settings')
+      .select('id')
+      .eq('user_id', userId)
+      .single();
+
+    let result;
+    if (checkError && checkError.code === 'PGRST116') {
+      // Create new settings
+      result = await supabase
+        .from('user_settings')
+        .insert({
+          user_id: userId,
+          ...updates
+        })
+        .select()
+        .single();
+    } else {
+      // Update existing settings
+      result = await supabase
+        .from('user_settings')
+        .update(updates)
+        .eq('user_id', userId)
+        .select()
+        .single();
+    }
+
+    if (result.error) {
+      throw result.error;
+    }
+
+    res.json({ success: true, settings: result.data });
+  } catch (error) {
+    console.error('❌ Error updating settings:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Update user profile (for registration and profile updates)
+app.post('/api/users/profile/:userId', async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const { legalName, address, phoneNumber } = req.body;
+
+    const updates = {};
+    if (legalName !== undefined) updates.legal_name = legalName;
+    if (address !== undefined) updates.address = address;
+    if (phoneNumber !== undefined) updates.phone_number = phoneNumber;
+
+    if (Object.keys(updates).length === 0) {
+      return res.status(400).json({ error: 'No fields to update' });
+    }
+
+    const { data, error } = await supabase
+      .from('user_profiles')
+      .upsert({
+        id: userId,
+        ...updates
+      }, { onConflict: 'id' })
+      .select()
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    res.json({ success: true, profile: data });
+  } catch (error) {
+    console.error('❌ Error updating user profile:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // ==================== WEBHOOK HELPERS ====================
 
 // Setup incoming message handlers for a client
