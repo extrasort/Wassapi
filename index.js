@@ -375,6 +375,12 @@ async function restoreClient(userId, sessionId) {
             // Store client in map if not already stored
             clients.set(sessionId, client);
             
+            const { data: session } = await supabase
+              .from('whatsapp_sessions')
+              .select('user_id')
+              .eq('session_id', sessionId)
+              .single();
+            
             await supabase
               .from('whatsapp_sessions')
               .update({ 
@@ -382,6 +388,24 @@ async function restoreClient(userId, sessionId) {
                 last_activity: new Date().toISOString() 
               })
               .eq('session_id', sessionId);
+            
+            // Track subscription usage for restored session (if it's a new number)
+            if (session && session.user_id) {
+              const activeSubscription = await getActiveSubscription(session.user_id);
+              if (activeSubscription) {
+                // Check if this is a new number by counting existing connected sessions
+                const { count } = await supabase
+                  .from('whatsapp_sessions')
+                  .select('*', { count: 'exact', head: true })
+                  .eq('user_id', session.user_id)
+                  .eq('status', 'connected');
+                
+                // Only increment if this is the first connected session (new number)
+                if (count === 1) {
+                  await incrementSubscriptionUsage(activeSubscription.id, 0, 1);
+                }
+              }
+            }
             
             // Backup session data to Supabase Storage
             backupSession(sessionId).catch(err => {
