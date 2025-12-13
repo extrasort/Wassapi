@@ -984,9 +984,9 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
 
     // Concise but informative OTP message format
     // Default to Arabic/English bilingual if no language specified
-    const language = req.body.language || 'ar'; // 'ar' or 'en'
+    const messageLanguage = language || 'ar'; // 'ar' or 'en'
     let message;
-    if (language === 'en') {
+    if (messageLanguage === 'en') {
       message = `Your verification code is: ${otp}\nValid for 5 minutes.`;
     } else {
       message = `رمز التحقق الخاص بك هو: ${otp}\nصالح لمدة 5 دقائق.`;
