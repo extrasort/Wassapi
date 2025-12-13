@@ -1702,6 +1702,27 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
     }
 
+    // Check subscription limits
+    const subscriptionCheck = await checkSubscriptionLimits(req.userId, 1, 0);
+    if (!subscriptionCheck.allowed) {
+      return res.status(403).json({
+        error: 'Subscription limit exceeded',
+        reason: subscriptionCheck.reason,
+        details: subscriptionCheck
+      });
+    }
+
+    // Check rate limits
+    const rateLimitCheck = await checkRateLimit(req.userId, 1);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        reason: rateLimitCheck.reason,
+        limit: rateLimitCheck.limit,
+        current: rateLimitCheck.current
+      });
+    }
+
     // Check and deduct balance
     const balanceCheck = await deductBalance(req.userId, req.sessionId, `OTP sent to ${recipient} via API`, `api_otp_${Date.now()}`);
     if (!balanceCheck.success) {
