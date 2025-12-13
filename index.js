@@ -640,6 +640,12 @@ async function initializeClient(userId, sessionId) {
         console.error('❌ Error updating session status:', error);
       } else {
         console.log('✅ Session status updated to connected');
+        
+        // Track subscription usage for new number
+        const activeSubscription = await getActiveSubscription(userId);
+        if (activeSubscription) {
+          await incrementSubscriptionUsage(activeSubscription.id, 0, 1);
+        }
       }
       
       // Backup session data to Supabase Storage (async, don't block)
@@ -751,6 +757,17 @@ app.post('/api/whatsapp/connect', async (req, res) => {
     if (!userId || !sessionId) {
       console.error('❌ Missing userId or sessionId');
       return res.status(400).json({ error: 'userId and sessionId are required' });
+    }
+
+    // Check subscription limits for new number
+    const subscriptionCheck = await checkSubscriptionLimits(userId, 0, 1);
+    if (!subscriptionCheck.allowed) {
+      return res.status(403).json({
+        error: 'Subscription limit exceeded',
+        reason: subscriptionCheck.reason,
+        details: subscriptionCheck,
+        message: 'You have reached the maximum number of WhatsApp accounts allowed by your subscription. Please upgrade your subscription to connect more accounts.'
+      });
     }
 
     // Check if user already has a connected session
@@ -971,6 +988,27 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
     }
 
+    // Check subscription limits
+    const subscriptionCheck = await checkSubscriptionLimits(userId, 1, 0);
+    if (!subscriptionCheck.allowed) {
+      return res.status(403).json({
+        error: 'Subscription limit exceeded',
+        reason: subscriptionCheck.reason,
+        details: subscriptionCheck
+      });
+    }
+
+    // Check rate limits
+    const rateLimitCheck = await checkRateLimit(userId, 1);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        reason: rateLimitCheck.reason,
+        limit: rateLimitCheck.limit,
+        current: rateLimitCheck.current
+      });
+    }
+
     // Check and deduct wallet balance
     const balanceCheck = await deductBalance(userId, sessionId, `OTP sent to ${recipient}`, `otp_${Date.now()}`);
     if (!balanceCheck.success) {
@@ -1087,6 +1125,11 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       status: 'sent',
     });
 
+      // Track subscription usage
+      if (subscriptionCheck.subscription_id) {
+        await incrementSubscriptionUsage(subscriptionCheck.subscription_id, 1, 0);
+      }
+
       res.json({ 
         success: true,
         balance: balanceCheck.balanceAfter,
@@ -1196,6 +1239,27 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
         .update({ status: 'disconnected' })
         .eq('session_id', sessionId);
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect your account.' });
+    }
+
+    // Check subscription limits
+    const subscriptionCheck = await checkSubscriptionLimits(userId, recipients.length, 0);
+    if (!subscriptionCheck.allowed) {
+      return res.status(403).json({
+        error: 'Subscription limit exceeded',
+        reason: subscriptionCheck.reason,
+        details: subscriptionCheck
+      });
+    }
+
+    // Check rate limits
+    const rateLimitCheck = await checkRateLimit(userId, recipients.length);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        reason: rateLimitCheck.reason,
+        limit: rateLimitCheck.limit,
+        current: rateLimitCheck.current
+      });
     }
 
     // Calculate total cost
@@ -1362,6 +1426,11 @@ app.post('/api/whatsapp/send-announcement', async (req, res) => {
     });
 
     console.log(`✅ Announcement sent: ${sent}/${recipients.length} successful`);
+
+    // Track subscription usage (only for successfully sent messages)
+    if (subscriptionCheck && subscriptionCheck.subscription_id && sent > 0) {
+      await incrementSubscriptionUsage(subscriptionCheck.subscription_id, sent, 0);
+    }
 
     // Trigger webhooks for announcement (async, don't wait)
     triggerWebhooks(userId, sessionId, 'announcement', {
@@ -1682,6 +1751,11 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
         status: 'sent',
       });
 
+      // Track subscription usage
+      if (subscriptionCheck.subscription_id) {
+        await incrementSubscriptionUsage(subscriptionCheck.subscription_id, 1, 0);
+      }
+
       // Trigger webhooks for successful OTP send (async, don't wait)
       triggerWebhooks(req.userId, req.sessionId, 'otp', {
         success: true,
@@ -1767,6 +1841,29 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
         });
       }
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
+    }
+
+    // Check subscription limits
+    const subscriptionCheck = await checkSubscriptionLimits(req.userId, 1, 0);
+    if (!subscriptionCheck.allowed) {
+      return res.status(403).json({
+        error: 'Subscription limit exceeded',
+        reason: subscriptionCheck.reason,
+        details: subscriptionCheck
+      });
+    }
+
+    // Check rate limits
+    const rateLimitCheck = await checkRateLimit(req.userId, 1);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        reason: rateLimitCheck.reason,
+        limit: rateLimitCheck.limit,
+        current: rateLimitCheck.current,
+        retryAfter: rateLimitCheck.reason === 'rate_limit_minute' ? 60 : 
+                   rateLimitCheck.reason === 'rate_limit_hour' ? 3600 : 86400
+      });
     }
 
     // Check and deduct balance
@@ -1860,6 +1957,11 @@ app.post('/api/v1/messages/send', authenticateApiKey, async (req, res) => {
       }
       
       const messageResult = await client.sendMessage(chatId, message);
+
+      // Track subscription usage
+      if (subscriptionCheck.subscription_id) {
+        await incrementSubscriptionUsage(subscriptionCheck.subscription_id, 1, 0);
+      }
 
       // Log to database
       await supabase.from('automation_logs').insert({
@@ -1985,6 +2087,27 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
         });
       }
       return res.status(400).json({ error: 'WhatsApp session is disconnected. Please reconnect via the dashboard.' });
+    }
+
+    // Check subscription limits
+    const subscriptionCheck = await checkSubscriptionLimits(req.userId, recipients.length, 0);
+    if (!subscriptionCheck.allowed) {
+      return res.status(403).json({
+        error: 'Subscription limit exceeded',
+        reason: subscriptionCheck.reason,
+        details: subscriptionCheck
+      });
+    }
+
+    // Check rate limits
+    const rateLimitCheck = await checkRateLimit(req.userId, recipients.length);
+    if (!rateLimitCheck.allowed) {
+      return res.status(429).json({
+        error: 'Rate limit exceeded',
+        reason: rateLimitCheck.reason,
+        limit: rateLimitCheck.limit,
+        current: rateLimitCheck.current
+      });
     }
 
     // Calculate total cost
@@ -2673,6 +2796,146 @@ app.post('/api/users/profile/:userId', async (req, res) => {
     res.status(500).json({ error: error.message });
   }
 });
+
+// ==================== SUBSCRIPTION & RATE LIMITING HELPERS ====================
+
+// Check subscription limits
+async function checkSubscriptionLimits(userId, messagesNeeded = 1, numbersNeeded = 0) {
+  try {
+    const { data, error } = await supabase.rpc('check_subscription_limits', {
+      p_user_id: userId,
+      p_messages_needed: messagesNeeded,
+      p_numbers_needed: numbersNeeded
+    });
+
+    if (error) {
+      console.error('Error checking subscription limits:', error);
+      // If function doesn't exist or error, allow (fallback)
+      return { allowed: true };
+    }
+
+    return data || { allowed: true };
+  } catch (error) {
+    console.error('Error in checkSubscriptionLimits:', error);
+    return { allowed: true }; // Fallback: allow if check fails
+  }
+}
+
+// Increment subscription usage
+async function incrementSubscriptionUsage(subscriptionId, messages = 1, numbers = 0) {
+  try {
+    await supabase.rpc('increment_subscription_usage', {
+      p_subscription_id: subscriptionId,
+      p_messages: messages,
+      p_numbers: numbers
+    });
+  } catch (error) {
+    console.error('Error incrementing subscription usage:', error);
+    // Non-blocking error
+  }
+}
+
+// Check rate limits
+async function checkRateLimit(userId, messageCount = 1) {
+  try {
+    const { data: settings, error } = await supabase
+      .from('user_settings')
+      .select('rate_limit_per_minute, rate_limit_per_hour, rate_limit_per_day')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching rate limit settings:', error);
+      return { allowed: true }; // Fallback: allow if check fails
+    }
+
+    // If no settings, use defaults
+    const limits = settings || {
+      rate_limit_per_minute: 10,
+      rate_limit_per_hour: 100,
+      rate_limit_per_day: 1000
+    };
+
+    // Check messages sent in last minute
+    const oneMinuteAgo = new Date(Date.now() - 60 * 1000).toISOString();
+    const { count: minuteCount } = await supabase
+      .from('automation_logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', oneMinuteAgo);
+
+    if (minuteCount + messageCount > limits.rate_limit_per_minute) {
+      return {
+        allowed: false,
+        reason: 'rate_limit_minute',
+        limit: limits.rate_limit_per_minute,
+        current: minuteCount
+      };
+    }
+
+    // Check messages sent in last hour
+    const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { count: hourCount } = await supabase
+      .from('automation_logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', oneHourAgo);
+
+    if (hourCount + messageCount > limits.rate_limit_per_hour) {
+      return {
+        allowed: false,
+        reason: 'rate_limit_hour',
+        limit: limits.rate_limit_per_hour,
+        current: hourCount
+      };
+    }
+
+    // Check messages sent in last day
+    const oneDayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const { count: dayCount } = await supabase
+      .from('automation_logs')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_id', userId)
+      .gte('created_at', oneDayAgo);
+
+    if (dayCount + messageCount > limits.rate_limit_per_day) {
+      return {
+        allowed: false,
+        reason: 'rate_limit_day',
+        limit: limits.rate_limit_per_day,
+        current: dayCount
+      };
+    }
+
+    return { allowed: true };
+  } catch (error) {
+    console.error('Error in checkRateLimit:', error);
+    return { allowed: true }; // Fallback: allow if check fails
+  }
+}
+
+// Get active subscription for user
+async function getActiveSubscription(userId) {
+  try {
+    const { data, error } = await supabase
+      .from('user_subscriptions')
+      .select('id, tier_key, messages_used, numbers_used')
+      .eq('user_id', userId)
+      .eq('status', 'active')
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching subscription:', error);
+    }
+
+    return data || null;
+  } catch (error) {
+    console.error('Error in getActiveSubscription:', error);
+    return null;
+  }
+}
 
 // ==================== WEBHOOK HELPERS ====================
 
