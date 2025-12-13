@@ -882,7 +882,7 @@ function isClientReady(client) {
 app.post('/api/whatsapp/send-otp', async (req, res) => {
   try {
     console.log('📤 Send OTP request:', req.body);
-    const { sessionId, recipient, otp, userId } = req.body;
+    const { sessionId, recipient, otp, userId, language } = req.body;
 
     let client = clients.get(sessionId);
     if (!client) {
@@ -982,8 +982,15 @@ app.post('/api/whatsapp/send-otp', async (req, res) => {
       });
     }
 
-    // Concise OTP message format (short to avoid bans)
-    const message = `${otp}`;
+    // Concise but informative OTP message format
+    // Default to Arabic/English bilingual if no language specified
+    const language = req.body.language || 'ar'; // 'ar' or 'en'
+    let message;
+    if (language === 'en') {
+      message = `Your verification code is: ${otp}\nValid for 5 minutes.`;
+    } else {
+      message = `رمز التحقق الخاص بك هو: ${otp}\nصالح لمدة 5 دقائق.`;
+    }
     
     // Format phone number (remove any non-digits except +, then remove +)
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
@@ -1494,7 +1501,7 @@ app.get('/api/v1/wallet/transactions', authenticateApiKey, async (req, res) => {
 // Send OTP via API Key (separate endpoint with fixed message format)
 app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
   try {
-    const { recipient, otp } = req.body;
+    const { recipient, otp, language } = req.body;
 
     if (!recipient || !otp) {
       return res.status(400).json({ error: 'recipient and otp are required' });
@@ -1598,8 +1605,15 @@ app.post('/api/v1/otp/send', authenticateApiKey, async (req, res) => {
       });
     }
 
-    // Concise OTP message format (short to avoid bans)
-    const message = `${otp}`;
+    // Concise but informative OTP message format
+    // Default to Arabic/English bilingual if no language specified
+    const messageLanguage = language || 'ar'; // 'ar' or 'en'
+    let message;
+    if (messageLanguage === 'en') {
+      message = `Your verification code is: ${otp}\nValid for 5 minutes.`;
+    } else {
+      message = `رمز التحقق الخاص بك هو: ${otp}\nصالح لمدة 5 دقائق.`;
+    }
 
     // Format phone number
     const formattedNumber = recipient.replace(/[^\d+]/g, '').replace(/^\+/, '');
