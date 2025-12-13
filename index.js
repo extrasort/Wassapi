@@ -412,13 +412,7 @@ async function restoreClient(userId, sessionId) {
               console.error(`⚠️ Failed to backup session ${sessionId}:`, err.message);
             });
             
-            // Log connection event
-            const { data: session } = await supabase
-              .from('whatsapp_sessions')
-              .select('user_id')
-              .eq('session_id', sessionId)
-              .single();
-            
+            // Log connection event (reuse session variable from above)
             if (session) {
               try {
                 await supabase.from('connection_events').insert({
