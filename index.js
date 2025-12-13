@@ -2213,6 +2213,11 @@ app.post('/api/v1/messages/send-bulk', authenticateApiKey, async (req, res) => {
       });
     }
 
+    // Track subscription usage (only for successfully sent messages)
+    if (subscriptionCheck && subscriptionCheck.subscription_id && sent > 0) {
+      await incrementSubscriptionUsage(subscriptionCheck.subscription_id, sent, 0);
+    }
+
     res.json({
       success: true,
       sent,
